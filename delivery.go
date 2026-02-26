@@ -13,6 +13,7 @@ type WebhookDelivery struct {
 	client *WebhookClient
 	logger *zap.Logger
 	wg     sync.WaitGroup
+	sem    chan struct{}
 }
 
 // NewWebhookDelivery creates a new webhook delivery manager
@@ -20,6 +21,7 @@ func NewWebhookDelivery(client *WebhookClient, logger *zap.Logger) *WebhookDeliv
 	return &WebhookDelivery{
 		client: client,
 		logger: logger,
+		sem:    make(chan struct{}, 100), // Limit concurrent goroutines to 100
 	}
 }
 
@@ -35,6 +37,8 @@ func (d *WebhookDelivery) deliverAsync(ctx context.Context, domain string, statu
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
+		d.sem <- struct{}{}        // Acquire semaphore
+		defer func() { <-d.sem }() // Release semaphore
 
 		attempts := uint(10) // Default from retry library
 		if d.client.config.RetryCount != nil {
@@ -62,6 +66,7 @@ func (d *WebhookDelivery) deliverAsync(ctx context.Context, domain string, statu
 			d.logger.Error(LogMsgWebhookDeliveryFailed,
 				zap.String("domain", domain),
 				zap.String("status", string(status)),
+				zap.String("timestamp", timestamp),
 				zap.Error(err))
 		} else {
 			d.logger.Info(LogMsgWebhookDeliverySucceeded,

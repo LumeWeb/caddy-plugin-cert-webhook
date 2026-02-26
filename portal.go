@@ -12,6 +12,20 @@ import (
 // DefaultEndpoint is the default API endpoint for the IPFS portal service.
 const DefaultEndpoint = "ipfs.pinner.xyz"
 
+// validEndpoint checks if an endpoint contains only valid domain characters
+func validEndpoint(endpoint string) bool {
+	if endpoint == "" {
+		return false
+	}
+	for i := 0; i < len(endpoint); i++ {
+		c := endpoint[i]
+		if !(c == '.' || c == '-' || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
 // ClientOption is an option for configuring the Portal client.
 type ClientOption func(*clientConfig)
 
@@ -62,10 +76,14 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 		opt(cfg)
 	}
 
+	if !validEndpoint(cfg.endpoint) {
+		return nil, fmt.Errorf("invalid endpoint: %s", cfg.endpoint)
+	}
+
 	serverURL := "https://" + cfg.endpoint
-	var httpClient *http.Client
-	if cfg.httpClient != nil {
-		httpClient = cfg.httpClient
+	httpClient := cfg.httpClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
 	}
 
 	c, err := client.NewClientWithResponses(serverURL, client.WithHTTPClient(httpClient))
@@ -79,9 +97,7 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 // addGatewaySecret returns a RequestEditorFn that adds the X-Gateway-Secret header.
 func (c *Client) addGatewaySecret() client.RequestEditorFn {
 	return func(ctx context.Context, req *http.Request) error {
-		if c.gatewaySecret != "" {
-			req.Header.Set("X-Gateway-Secret", c.gatewaySecret)
-		}
+		req.Header.Set("X-Gateway-Secret", c.gatewaySecret)
 		return nil
 	}
 }
