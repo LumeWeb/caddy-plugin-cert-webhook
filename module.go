@@ -7,6 +7,8 @@ import (
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
 )
 
+const caddyfilePortalURL = "portal_url"
+
 func init() {
 	caddy.RegisterModule(&WebhookHandler{})
 	httpcaddyfile.RegisterHandlerDirective("cert_webhook", parseCaddyfile)
@@ -17,7 +19,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	var handler WebhookHandler
 	for h.Next() {
 		switch h.Val() {
-		case "portal_url":
+		case caddyfilePortalURL:
 			if !h.NextArg() {
 				return &handler, h.ArgErr()
 			}
