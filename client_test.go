@@ -2,97 +2,107 @@ package certwebhook
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	ipfs "go.lumeweb.com/ipfs-sdk"
+	servicemocks "go.lumeweb.com/ipfs-sdk/mocks/services"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
-func TestWebhookClient_SendWebhook(t *testing.T) {
-	tests := []struct {
-		name           string
-		server         *httptest.Server
-		statusCode     int
-		responseBody   string
-		wantErr        bool
-		wantStatusCode int
-	}{
-		{
-			name: "successful webhook",
-			server: httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodPost {
-					t.Errorf("expected POST request, got %s", r.Method)
-				}
-				if r.URL.Path != "/internal/websites/example.com/ssl-status" {
-					t.Errorf("unexpected path: %s", r.URL.Path)
-				}
-				if r.Header.Get(GatewaySecretHeader) != "test-secret" {
-					t.Errorf("expected gateway secret header")
-				}
-				w.WriteHeader(http.StatusOK)
-			})),
-			statusCode:     http.StatusOK,
-			responseBody:   "",
-			wantErr:        false,
-			wantStatusCode: http.StatusOK,
-		},
-		{
-			name: "webhook with 404",
-			server: httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusNotFound)
-				w.Write([]byte("not found"))
-			})),
-			statusCode:     http.StatusNotFound,
-			responseBody:   "not found",
-			wantErr:        true,
-			wantStatusCode: http.StatusNotFound,
-		},
-		{
-			name: "webhook with 500",
-			server: httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte("internal server error"))
-			})),
-			statusCode:     http.StatusInternalServerError,
-			responseBody:   "internal server error",
-			wantErr:        true,
-			wantStatusCode: http.StatusInternalServerError,
-		},
-	}
+func TestWebhookDelivery_SuccessfulDelivery(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	obs, _ := observer.New(zap.DebugLevel)
+	logger := zap.New(obs)
+	delivery := NewWebhookDelivery(mockSvc, logger)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer tt.server.Close()
+	ts := time.Now().Format(time.RFC3339)
+	mockSvc.EXPECT().UpdateSSLStatusInternal(
+		context.Background(),
+		"example.com",
+		ipfs.SSLStatusUpdateRequest{
+			Status:    string(SSLStatusReady),
+			Timestamp: &ts,
+		},
+	).Return(nil)
 
-			client := NewWebhookClientWithConfig(&Config{PortalURL: tt.server.URL, GatewaySecret: "test-secret", Timeout: 30 * time.Second, RetryCount: new(5)})
-			err := client.sendWebhook(context.Background(), "example.com", SSLStatusReady, "", time.Now().Format(time.RFC3339))
-
-			if (err != nil) != tt.wantErr {
-				t.Errorf("sendWebhook() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
+	delivery.deliverAsync(context.Background(), "example.com", SSLStatusReady, "", ts)
+	delivery.Wait()
 }
 
-func TestWebhookClient_Headers(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("expected POST request, got %s", r.Method)
-		}
-		if r.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("expected Content-Type application/json, got %s", r.Header.Get("Content-Type"))
-		}
-		if r.Header.Get(GatewaySecretHeader) != "my-secret" {
-			t.Errorf("expected X-Gateway-Secret header, got %s", r.Header.Get(GatewaySecretHeader))
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
+func TestWebhookDelivery_ErrorStatus(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	obs, _ := observer.New(zap.InfoLevel)
+	logger := zap.New(obs)
+	delivery := NewWebhookDelivery(mockSvc, logger)
 
-	client := NewWebhookClientWithConfig(&Config{PortalURL: server.URL, GatewaySecret: "my-secret", Timeout: 30 * time.Second, RetryCount: new(5)})
-	err := client.sendWebhook(context.Background(), "example.com", SSLStatusReady, "", time.Now().Format(time.RFC3339))
+	ts := time.Now().Format(time.RFC3339)
+	errorMsg := "certificate validation failed"
+	mockSvc.EXPECT().UpdateSSLStatusInternal(
+		context.Background(),
+		"example.com",
+		ipfs.SSLStatusUpdateRequest{
+			Status:    string(SSLStatusFailed),
+			Error:     &errorMsg,
+			Timestamp: &ts,
+		},
+	).Return(nil)
 
-	if err != nil {
-		t.Errorf("sendWebhook() error = %v", err)
+	delivery.deliverAsync(context.Background(), "example.com", SSLStatusFailed, errorMsg, ts)
+	delivery.Wait()
+}
+
+func TestWebhookDelivery_FailedDelivery(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	obs, logs := observer.New(zap.InfoLevel)
+	logger := zap.New(obs)
+	delivery := NewWebhookDelivery(mockSvc, logger)
+
+	ts := time.Now().Format(time.RFC3339)
+	mockSvc.EXPECT().UpdateSSLStatusInternal(
+		context.Background(),
+		"example.com",
+		ipfs.SSLStatusUpdateRequest{
+			Status:    string(SSLStatusReady),
+			Timestamp: &ts,
+		},
+	).Return(fmt.Errorf("internal server error"))
+
+	delivery.deliverAsync(context.Background(), "example.com", SSLStatusReady, "", ts)
+	delivery.Wait()
+
+	failureLogs := 0
+	for _, entry := range logs.All() {
+		if entry.Message == LogMsgWebhookDeliveryFailed {
+			failureLogs++
+		}
 	}
+	assert.Equal(t, 1, failureLogs, "expected failure log after delivery error")
+}
+
+func TestWebhookDelivery_MultipleConcurrentDeliveries(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	obs, _ := observer.New(zap.InfoLevel)
+	logger := zap.New(obs)
+	delivery := NewWebhookDelivery(mockSvc, logger)
+
+	domains := []string{"example1.com", "example2.com", "example3.com"}
+	for _, domain := range domains {
+		ts := time.Now().Format(time.RFC3339)
+		d := domain
+		mockSvc.EXPECT().UpdateSSLStatusInternal(
+			context.Background(),
+			d,
+			ipfs.SSLStatusUpdateRequest{
+				Status:    string(SSLStatusReady),
+				Timestamp: &ts,
+			},
+		).Return(nil)
+		delivery.deliverAsync(context.Background(), domain, SSLStatusReady, "", ts)
+	}
+
+	delivery.Wait()
 }

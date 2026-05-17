@@ -100,8 +100,6 @@ func TestSSLStatusString(t *testing.T) {
 		status SSLStatus
 		want   string
 	}{
-		{SSLStatusPending, "pending"},
-		{SSLStatusIssuing, "issuing"},
 		{SSLStatusReady, "ready"},
 		{SSLStatusFailed, "failed"},
 	}

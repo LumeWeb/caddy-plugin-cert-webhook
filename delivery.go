@@ -4,64 +4,48 @@ import (
 	"context"
 	"sync"
 
-	"github.com/avast/retry-go/v4"
+	ipfs "go.lumeweb.com/ipfs-sdk"
 	"go.uber.org/zap"
 )
 
-// WebhookDelivery handles async webhook delivery
 type WebhookDelivery struct {
-	client *WebhookClient
-	logger *zap.Logger
-	wg     sync.WaitGroup
-	sem    chan struct{}
+	websites ipfs.WebsitesService
+	logger   *zap.Logger
+	wg       sync.WaitGroup
+	sem      chan struct{}
 }
 
-// NewWebhookDelivery creates a new webhook delivery manager
-func NewWebhookDelivery(client *WebhookClient, logger *zap.Logger) *WebhookDelivery {
+func NewWebhookDelivery(websites ipfs.WebsitesService, logger *zap.Logger) *WebhookDelivery {
 	return &WebhookDelivery{
-		client: client,
-		logger: logger,
-		sem:    make(chan struct{}, 100), // Limit concurrent goroutines to 100
+		websites: websites,
+		logger:   logger,
+		sem:      make(chan struct{}, 100),
 	}
 }
 
-// Log message constants
 const (
 	LogMsgWebhookDeliverySucceeded = "webhook delivery succeeded"
-	LogMsgWebhookDeliveryFailed    = "webhook delivery failed after retries"
-	LogMsgRetrying                 = "retrying webhook delivery"
+	LogMsgWebhookDeliveryFailed    = "webhook delivery failed"
 )
 
-// deliverAsync sends webhooks asynchronously without blocking
 func (d *WebhookDelivery) deliverAsync(ctx context.Context, domain string, status SSLStatus, errorMsg, timestamp string) {
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
-		d.sem <- struct{}{}        // Acquire semaphore
-		defer func() { <-d.sem }() // Release semaphore
+		d.sem <- struct{}{}
+		defer func() { <-d.sem }()
 
-		attempts := uint(10) // Default from retry library
-		if d.client.config.RetryCount != nil {
-			attempts = uint(*d.client.config.RetryCount)
-		}
-
-		// Use a background context for the async delivery to prevent premature cancellation from the caller's context.
 		bgCtx := context.Background()
 
-		err := retry.Do(
-			func() error {
-				return d.client.sendWebhook(bgCtx, domain, status, errorMsg, timestamp)
-			},
-			retry.Context(bgCtx),
-			retry.Attempts(attempts),
-			retry.DelayType(retry.BackOffDelay),
-			retry.OnRetry(func(n uint, err error) {
-				d.logger.Debug(LogMsgRetrying,
-					zap.Uint("attempt", n),
-					zap.Error(err))
-			}),
-		)
+		req := ipfs.SSLStatusUpdateRequest{
+			Status:    string(status),
+			Timestamp: &timestamp,
+		}
+		if errorMsg != "" {
+			req.Error = &errorMsg
+		}
 
+		err := d.websites.UpdateSSLStatusInternal(bgCtx, domain, req)
 		if err != nil {
 			d.logger.Error(LogMsgWebhookDeliveryFailed,
 				zap.String("domain", domain),
@@ -77,7 +61,6 @@ func (d *WebhookDelivery) deliverAsync(ctx context.Context, domain string, statu
 	}()
 }
 
-// Wait waits for all pending webhook deliveries to complete
 func (d *WebhookDelivery) Wait() {
 	d.wg.Wait()
 }
