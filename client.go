@@ -18,7 +18,10 @@ func NewPortalClient(portalURL, gatewaySecret string) (*PortalClient, error) {
 		return nil, fmt.Errorf("invalid portal URL: %w", err)
 	}
 	if u.Scheme == "" {
-		u.Scheme = "https"
+		u, err = url.Parse("https://" + portalURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid portal URL: %w", err)
+		}
 	}
 
 	client, err := ipfs.NewClient(
