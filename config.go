@@ -12,8 +12,8 @@ const (
 )
 
 type Config struct {
-	PortalURL     string `json:"portal_url,omitempty"`
-	GatewaySecret string `json:"-"`
+	PortalURL     string
+	GatewaySecret string
 }
 
 func (c *Config) Provision() {

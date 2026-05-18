@@ -1,33 +1,25 @@
 package certwebhook
 
 import (
+	"encoding/json"
+
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
 )
 
-const caddyfilePortalURL = "portal_url"
-
 func init() {
-	caddy.RegisterModule(&WebhookHandler{})
-	httpcaddyfile.RegisterHandlerDirective("cert_webhook", parseCaddyfile)
+	caddy.RegisterModule(CertWebhookApp{})
+	httpcaddyfile.RegisterGlobalOption("cert_webhook", parseGlobalOption)
 }
 
-// parseCaddyfile sets up the handler from Caddyfile tokens
-func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	var handler WebhookHandler
-	for h.Next() {
-		switch h.Val() {
-		case caddyfilePortalURL:
-			if !h.NextArg() {
-				return &handler, h.ArgErr()
-			}
-			handler.PortalURL = h.Val()
-		default:
-			return nil, h.Errf("unrecognized subdirective '%s'", h.Val())
-		}
-	}
+var _ caddy.App = (*CertWebhookApp)(nil)
 
-	return &handler, nil
+func parseGlobalOption(d *caddyfile.Dispenser, _ any) (any, error) {
+	d.Next()
+	return httpcaddyfile.App{
+		Name:  "cert_webhook",
+		Value: json.RawMessage(`{}`),
+	}, nil
 }

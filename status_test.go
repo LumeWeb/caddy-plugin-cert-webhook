@@ -5,7 +5,7 @@ import (
 )
 
 func TestMapEventToStatus(t *testing.T) {
-	handler := &WebhookHandler{}
+	handler := &CertWebhookApp{}
 
 	tests := []struct {
 		name      string

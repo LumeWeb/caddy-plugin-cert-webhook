@@ -48,7 +48,7 @@ type EventData struct {
 	Error string `json:"error,omitempty"`
 
 	// Raw is the raw event data for debugging
-	Raw map[string]interface{} `json:"-"`
+	Raw map[string]any `json:"-"`
 
 	// EventType is the type of event (cert_obtained, cert_renewed, cert_expired)
 	EventType string `json:"event_type"`
@@ -57,7 +57,7 @@ type EventData struct {
 // Event handlers for certificate lifecycle events
 
 // subscribeToEvents registers handlers for certificate events
-func (h *WebhookHandler) subscribeToEvents(ctx caddy.Context) error {
+func (h *CertWebhookApp) subscribeToEvents(ctx caddy.Context) error {
 	// Get the events app from context
 	eventsAppIface, err := ctx.App("events")
 	if err != nil {
@@ -80,13 +80,11 @@ func (h *WebhookHandler) subscribeToEvents(ctx caddy.Context) error {
 	}
 	h.logger.Info(LogMsgSubscribedToCertObtained)
 
-	// Subscribe to cert_renewed event
 	if err := eventsApp.On(EventCertRenewed, h); err != nil {
 		return fmt.Errorf("failed to subscribe to cert_renewed event: %w", err)
 	}
 	h.logger.Info(LogMsgSubscribedToCertRenewed)
 
-	// Subscribe to cert_expired event
 	if err := eventsApp.On(EventCertExpired, h); err != nil {
 		return fmt.Errorf("failed to subscribe to cert_expired event: %w", err)
 	}
@@ -96,12 +94,12 @@ func (h *WebhookHandler) subscribeToEvents(ctx caddy.Context) error {
 }
 
 // Handle implements caddyevents.Handler interface to process certificate events
-func (h *WebhookHandler) Handle(ctx context.Context, data caddy.Event) error {
+func (h *CertWebhookApp) Handle(ctx context.Context, data caddy.Event) error {
 	eventName := data.Name()
 
 	switch eventName {
 	case EventCertObtained, EventCertRenewed, EventCertExpired:
-		return h.handleCertEvent(ctx, eventName, data)
+		return h.handleCertEvent(eventName, data)
 	default:
 		h.logger.Warn(LogMsgUnknownEventType, zap.String("event", eventName))
 		return nil
@@ -109,7 +107,9 @@ func (h *WebhookHandler) Handle(ctx context.Context, data caddy.Event) error {
 }
 
 // handleCertEvent processes certificate lifecycle events (obtained, renewed, expired)
-func (h *WebhookHandler) handleCertEvent(ctx context.Context, eventType string, data caddy.Event) error {
+func (h *CertWebhookApp) handleCertEvent(eventType string, data caddy.Event) error {
+	h.logger.Debug("handling cert event", zap.String("event_type", eventType))
+
 	eventData, err := h.extractEventData(eventType, data)
 	if err != nil {
 		h.logger.Error(LogMsgFailedToExtractEventData,
@@ -132,14 +132,14 @@ func (h *WebhookHandler) handleCertEvent(ctx context.Context, eventType string, 
 		zap.String("status", string(status)),
 		zap.String("timestamp", eventData.Timestamp))
 
-	return h.sendWebhook(ctx, eventData.Domain, status, eventData.Error, eventData.Timestamp)
+	return h.sendWebhook(eventData.Domain, status, eventData.Error, eventData.Timestamp)
 }
 
 // extractEventData extracts domain, timestamp, and error information from Caddy event data
-func (h *WebhookHandler) extractEventData(eventType string, event caddy.Event) (*EventData, error) {
+func (h *CertWebhookApp) extractEventData(eventType string, event caddy.Event) (*EventData, error) {
 	data := &EventData{
 		EventType: eventType,
-		Raw:       make(map[string]interface{}),
+		Raw:       make(map[string]any),
 	}
 
 	if len(event.Data) == 0 {
@@ -150,7 +150,8 @@ func (h *WebhookHandler) extractEventData(eventType string, event caddy.Event) (
 		return nil, fmt.Errorf("failed to unmarshal event data: %w", err)
 	}
 
-	// Extract timestamp from event data, default to current time
+	h.logger.Debug("raw event data decoded", zap.Any("data", data.Raw))
+
 	if ts, ok := data.Raw["ts"].(float64); ok {
 		sec := int64(ts)
 		nsec := int64((ts - float64(sec)) * 1e9)
@@ -161,13 +162,14 @@ func (h *WebhookHandler) extractEventData(eventType string, event caddy.Event) (
 
 	if domain, ok := data.Raw["domain"].(string); ok {
 		data.Domain = domain
-	} else if san, ok := data.Raw["sans"].([]interface{}); ok && len(san) > 0 {
+	} else if san, ok := data.Raw["sans"].([]any); ok && len(san) > 0 {
 		if d, ok := san[0].(string); ok {
 			data.Domain = d
 		}
 	}
 
 	if data.Domain == "" {
+		h.logger.Debug("no domain found in event data")
 		return nil, fmt.Errorf("no domain found in event data")
 	}
 
@@ -179,7 +181,7 @@ func (h *WebhookHandler) extractEventData(eventType string, event caddy.Event) (
 }
 
 // decodeJSON decodes JSON data from map[string]any to target
-func decodeJSON(data map[string]any, target interface{}) error {
+func decodeJSON(data map[string]any, target any) error {
 	jsonBytes, err := json.Marshal(data)
 	if err != nil {
 		return err
