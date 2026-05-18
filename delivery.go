@@ -28,12 +28,15 @@ const (
 	LogMsgWebhookDeliveryFailed    = "webhook delivery failed"
 )
 
-func (d *WebhookDelivery) deliverAsync(ctx context.Context, domain string, status SSLStatus, errorMsg, timestamp string) {
-	d.wg.Add(1)
-	go func() {
-		defer d.wg.Done()
+func (d *WebhookDelivery) deliverAsync(domain string, status SSLStatus, errorMsg, timestamp string) {
+	d.wg.Go(func() {
 		d.sem <- struct{}{}
 		defer func() { <-d.sem }()
+
+		d.logger.Debug("delivering webhook",
+			zap.String("domain", domain),
+			zap.String("status", string(status)),
+			zap.String("timestamp", timestamp))
 
 		bgCtx := context.Background()
 
@@ -58,7 +61,7 @@ func (d *WebhookDelivery) deliverAsync(ctx context.Context, domain string, statu
 				zap.String("status", string(status)),
 				zap.String("timestamp", timestamp))
 		}
-	}()
+	})
 }
 
 func (d *WebhookDelivery) Wait() {

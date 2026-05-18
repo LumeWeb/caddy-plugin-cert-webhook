@@ -1,7 +1,6 @@
 package certwebhook
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 
@@ -18,6 +17,10 @@ const (
 	LogMsgCleaningUpCertWebhookHandler  = "cleaning up cert webhook handler"
 	LogMsgWebhookDeliveryNotInitialized = "webhook delivery not initialized"
 	LogMsgFailedToCreatePortalClient    = "failed to create portal client"
+	LogMsgProvisionStarting             = "provision starting"
+	LogMsgProvisionComplete             = "provision complete"
+	LogMsgConfigResolved                = "config resolved from environment"
+	LogMsgCleanupComplete               = "cleanup complete"
 )
 
 var _ caddy.CleanerUpper = (*WebhookHandler)(nil)
@@ -25,9 +28,9 @@ var _ caddy.CleanerUpper = (*WebhookHandler)(nil)
 type WebhookHandler struct {
 	Config `json:"-"`
 
-	logger   *zap.Logger
-	portal   *PortalClient
-	delivery *WebhookDelivery
+	logger    *zap.Logger
+	portal    *PortalClient
+	delivery  *WebhookDelivery
 	eventsApp *caddyevents.App
 }
 
@@ -41,7 +44,13 @@ func (WebhookHandler) CaddyModule() caddy.ModuleInfo {
 func (h *WebhookHandler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
 
+	h.logger.Debug(LogMsgProvisionStarting)
+
 	h.Config.Provision()
+
+	h.logger.Debug(LogMsgConfigResolved,
+		zap.String("portal_url", h.PortalURL),
+		zap.Bool("gateway_secret_set", h.GatewaySecret != ""))
 
 	if err := h.Config.Validate(); err != nil {
 		h.logger.Error(LogMsgConfigValidationFailed, zap.Error(err))
@@ -66,6 +75,8 @@ func (h *WebhookHandler) Provision(ctx caddy.Context) error {
 		zap.String("portal_url", h.PortalURL),
 		zap.String("gateway_secret", "***REDACTED***"))
 
+	h.logger.Debug(LogMsgProvisionComplete)
+
 	return nil
 }
 
@@ -88,14 +99,22 @@ func (h *WebhookHandler) Cleanup() error {
 	h.delivery = nil
 	h.eventsApp = nil
 
+	h.logger.Debug(LogMsgCleanupComplete)
+
 	return nil
 }
 
-func (h *WebhookHandler) sendWebhook(ctx context.Context, domain string, status SSLStatus, errorMsg, timestamp string) error {
+func (h *WebhookHandler) sendWebhook(domain string, status SSLStatus, errorMsg, timestamp string) error {
 	if h.delivery == nil {
 		h.logger.Error(LogMsgWebhookDeliveryNotInitialized)
 		return fmt.Errorf("webhook delivery not initialized")
 	}
-	h.delivery.deliverAsync(ctx, domain, status, errorMsg, timestamp)
+
+	h.logger.Debug("sending webhook",
+		zap.String("domain", domain),
+		zap.String("status", string(status)),
+		zap.String("timestamp", timestamp))
+
+	h.delivery.deliverAsync(domain, status, errorMsg, timestamp)
 	return nil
 }

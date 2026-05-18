@@ -12,8 +12,9 @@ A Caddy v2 plugin that hooks into certificate lifecycle events and sends webhook
 - Subscribes to Caddy TLS certificate events (`cert_obtained`, `cert_renewed`, `cert_expired`)
 - Sends webhooks to portal endpoint with `X-Gateway-Secret` authentication
 - Maps Caddy events to portal SSL statuses (`pending`, `issuing`, `ready`, `failed`)
-- Async webhook delivery with exponential backoff retry for transient failures
+- Async webhook delivery with concurrency limiting
 - Non-blocking delivery to avoid disrupting certificate operations
+- Debug logging via Caddy's `{ debug }` global option
 
 ## Installation
 
@@ -23,77 +24,55 @@ Build Caddy with this plugin using [xcaddy](https://github.com/caddyserver/xcadd
 xcaddy build --with github.com/LumeWeb/caddy-plugin-cert-webhook
 ```
 
-## Quick Start
-
-```caddyfile
-{
-    order cert_webhook before file_server
-}
-
-example.com {
-    tls {
-        cert_webhook {
-            portal_url https://portal.example.com
-        }
-    }
-}
-```
-
-Set environment variables:
-
-```bash
-export PORTAL_URL=https://portal.example.com
-export GATEWAY_SECRET=your-secure-secret-key
-
-caddy run --config Caddyfile
-```
-
 ## Configuration
 
-### Caddyfile
-
-```caddyfile
-tls {
-    cert_webhook {
-        portal_url https://portal.example.com
-        timeout 30s
-        retry_count 5
-    }
-}
-```
-
-### JSON
-
-```json
-{
-    "http.handlers": {
-        "cert_webhook": {
-            "portal_url": "https://portal.example.com",
-            "timeout": "30s",
-            "retry_count": 5
-        }
-    }
-}
-```
-
-### Environment Variables
+All configuration is via environment variables:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `PORTAL_URL` | Yes | Base URL of the portal service |
 | `GATEWAY_SECRET` | Yes | Shared secret for authentication |
 
+### JSON Config
+
+Register the handler in your route:
+
+```json
+{
+    "apps": {
+        "http": {
+            "servers": {
+                "srv0": {
+                    "routes": [
+                        {
+                            "handle": [{
+                                "handler": "cert_webhook"
+                            }]
+                        }
+                    ]
+                }
+            }
+        }
+    }
+}
+```
+
+### Debug Logging
+
+Add `{ debug }` to your Caddyfile or set the log level in JSON config to see detailed operational logs:
+
+```caddyfile
+{
+    debug
+}
+```
+
+This enables debug-level output including event data, webhook delivery details, and config resolution.
+
 ## Webhook Format
 
-The plugin sends POST requests to `/internal/websites/:domain/ssl-status`:
+The plugin calls the portal SDK's `UpdateSSLStatusInternal` method with:
 
-**Headers:**
-```
-Content-Type: application/json
-X-Gateway-Secret: <configured_secret>
-```
-
-**Body:**
 ```json
 {
     "status": "ready",
@@ -112,9 +91,8 @@ X-Gateway-Secret: <configured_secret>
 
 ## Error Handling
 
-- **Transient errors** (5xx, network timeouts): Retried with exponential backoff (5 attempts max)
-- **Permanent errors** (4xx): Logged but not retried
-- Webhook delivery failures do not block certificate operations
+- Webhook delivery failures are logged but do not block certificate operations
+- Delivery uses a concurrency-limited worker pool (100 concurrent max)
 
 ## Development
 

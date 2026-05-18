@@ -30,7 +30,7 @@ func TestWebhookDelivery_FullIntegration(t *testing.T) {
 			},
 		).Return(nil)
 
-		delivery.deliverAsync(context.Background(), "example.com", SSLStatusReady, "", ts)
+		delivery.deliverAsync("example.com", SSLStatusReady, "", ts)
 		delivery.Wait()
 	})
 
@@ -52,7 +52,7 @@ func TestWebhookDelivery_FullIntegration(t *testing.T) {
 			},
 		).Return(nil)
 
-		delivery.deliverAsync(context.Background(), "example.com", SSLStatusFailed, errorMsg, ts)
+		delivery.deliverAsync("example.com", SSLStatusFailed, errorMsg, ts)
 		delivery.Wait()
 	})
 
@@ -72,7 +72,7 @@ func TestWebhookDelivery_FullIntegration(t *testing.T) {
 			},
 		).Return(fmt.Errorf("internal server error"))
 
-		delivery.deliverAsync(context.Background(), "example.com", SSLStatusReady, "", ts)
+		delivery.deliverAsync("example.com", SSLStatusReady, "", ts)
 		delivery.Wait()
 
 		failureLogs := 0
@@ -102,7 +102,7 @@ func TestWebhookDelivery_FullIntegration(t *testing.T) {
 					Timestamp: &ts,
 				},
 			).Return(nil)
-			delivery.deliverAsync(context.Background(), domain, SSLStatusReady, "", ts)
+			delivery.deliverAsync(domain, SSLStatusReady, "", ts)
 		}
 
 		delivery.Wait()
