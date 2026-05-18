@@ -57,7 +57,7 @@ type EventData struct {
 // Event handlers for certificate lifecycle events
 
 // subscribeToEvents registers handlers for certificate events
-func (h *WebhookHandler) subscribeToEvents(ctx caddy.Context) error {
+func (h *CertWebhookApp) subscribeToEvents(ctx caddy.Context) error {
 	// Get the events app from context
 	eventsAppIface, err := ctx.App("events")
 	if err != nil {
@@ -94,7 +94,7 @@ func (h *WebhookHandler) subscribeToEvents(ctx caddy.Context) error {
 }
 
 // Handle implements caddyevents.Handler interface to process certificate events
-func (h *WebhookHandler) Handle(ctx context.Context, data caddy.Event) error {
+func (h *CertWebhookApp) Handle(ctx context.Context, data caddy.Event) error {
 	eventName := data.Name()
 
 	switch eventName {
@@ -107,7 +107,7 @@ func (h *WebhookHandler) Handle(ctx context.Context, data caddy.Event) error {
 }
 
 // handleCertEvent processes certificate lifecycle events (obtained, renewed, expired)
-func (h *WebhookHandler) handleCertEvent(eventType string, data caddy.Event) error {
+func (h *CertWebhookApp) handleCertEvent(eventType string, data caddy.Event) error {
 	h.logger.Debug("handling cert event", zap.String("event_type", eventType))
 
 	eventData, err := h.extractEventData(eventType, data)
@@ -136,7 +136,7 @@ func (h *WebhookHandler) handleCertEvent(eventType string, data caddy.Event) err
 }
 
 // extractEventData extracts domain, timestamp, and error information from Caddy event data
-func (h *WebhookHandler) extractEventData(eventType string, event caddy.Event) (*EventData, error) {
+func (h *CertWebhookApp) extractEventData(eventType string, event caddy.Event) (*EventData, error) {
 	data := &EventData{
 		EventType: eventType,
 		Raw:       make(map[string]any),

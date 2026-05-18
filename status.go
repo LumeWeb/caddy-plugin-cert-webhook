@@ -3,15 +3,13 @@ package certwebhook
 import "fmt"
 
 const (
-	SSLStatusPending SSLStatus = "pending"
-	SSLStatusIssuing SSLStatus = "issuing"
 	SSLStatusReady   SSLStatus = "ready"
 	SSLStatusFailed  SSLStatus = "failed"
 )
 
 type SSLStatus string
 
-func (h *WebhookHandler) mapEventToStatus(eventType string, data *EventData) (SSLStatus, error) {
+func (a *CertWebhookApp) mapEventToStatus(eventType string, data *EventData) (SSLStatus, error) {
 	if data == nil {
 		return "", fmt.Errorf("event data is nil for event type: %s", eventType)
 	}

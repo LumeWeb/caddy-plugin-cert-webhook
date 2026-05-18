@@ -2,119 +2,106 @@ package certwebhook
 
 import (
 	"fmt"
-	"net/http"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 )
 
 const (
-	LogMsgConfigValidationFailed        = "configuration validation failed"
-	LogMsgFailedToSubscribeToEvents     = "failed to subscribe to events"
-	LogMsgCertWebhookHandlerProvisioned = "cert webhook handler provisioned"
-	LogMsgCleaningUpCertWebhookHandler  = "cleaning up cert webhook handler"
+	LogMsgConfigValidationFailed       = "configuration validation failed"
+	LogMsgFailedToSubscribeToEvents    = "failed to subscribe to events"
+	LogMsgFailedToCreatePortalClient   = "failed to create portal client"
+	LogMsgStarting                     = "cert_webhook app starting"
+	LogMsgStarted                      = "cert_webhook app started"
+	LogMsgStopping                     = "cert_webhook app stopping"
+	LogMsgStopped                      = "cert_webhook app stopped"
 	LogMsgWebhookDeliveryNotInitialized = "webhook delivery not initialized"
-	LogMsgFailedToCreatePortalClient    = "failed to create portal client"
-	LogMsgProvisionStarting             = "provision starting"
-	LogMsgProvisionComplete             = "provision complete"
-	LogMsgConfigResolved                = "config resolved from environment"
-	LogMsgCleanupComplete               = "cleanup complete"
 )
 
-var _ caddy.CleanerUpper = (*WebhookHandler)(nil)
-
-type WebhookHandler struct {
+type CertWebhookApp struct {
 	Config `json:"-"`
 
 	logger    *zap.Logger
+	ctx       caddy.Context
 	portal    *PortalClient
 	delivery  *WebhookDelivery
 	eventsApp *caddyevents.App
 }
 
-func (WebhookHandler) CaddyModule() caddy.ModuleInfo {
+func (CertWebhookApp) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.handlers.cert_webhook",
-		New: func() caddy.Module { return new(WebhookHandler) },
+		ID:  "cert_webhook",
+		New: func() caddy.Module { return new(CertWebhookApp) },
 	}
 }
 
-func (h *WebhookHandler) Provision(ctx caddy.Context) error {
-	h.logger = ctx.Logger(h)
+func (a *CertWebhookApp) Provision(ctx caddy.Context) error {
+	a.logger = ctx.Logger(a)
+	a.ctx = ctx
 
-	h.logger.Debug(LogMsgProvisionStarting)
+	a.Config.Provision()
 
-	h.Config.Provision()
+	a.logger.Debug("config resolved",
+		zap.String("portal_url", a.PortalURL),
+		zap.Bool("gateway_secret_set", a.GatewaySecret != ""))
 
-	h.logger.Debug(LogMsgConfigResolved,
-		zap.String("portal_url", h.PortalURL),
-		zap.Bool("gateway_secret_set", h.GatewaySecret != ""))
+	return a.Config.Validate()
+}
 
-	if err := h.Config.Validate(); err != nil {
-		h.logger.Error(LogMsgConfigValidationFailed, zap.Error(err))
-		return err
-	}
+func (a *CertWebhookApp) Start() error {
+	a.logger.Info(LogMsgStarting)
 
-	portal, err := NewPortalClient(h.PortalURL, h.GatewaySecret)
+	portal, err := NewPortalClient(a.PortalURL, a.GatewaySecret)
 	if err != nil {
-		h.logger.Error(LogMsgFailedToCreatePortalClient, zap.Error(err))
+		a.logger.Error(LogMsgFailedToCreatePortalClient, zap.Error(err))
 		return err
 	}
-	h.portal = portal
+	a.portal = portal
 
-	h.delivery = NewWebhookDelivery(h.portal.Websites(), h.logger)
+	a.delivery = NewWebhookDelivery(a.portal.Websites(), a.logger)
 
-	if err := h.subscribeToEvents(ctx); err != nil {
-		h.logger.Error(LogMsgFailedToSubscribeToEvents, zap.Error(err))
+	if err := a.subscribeToEvents(a.ctx); err != nil {
+		a.logger.Error(LogMsgFailedToSubscribeToEvents, zap.Error(err))
 		return err
 	}
 
-	h.logger.Info(LogMsgCertWebhookHandlerProvisioned,
-		zap.String("portal_url", h.PortalURL),
-		zap.String("gateway_secret", "***REDACTED***"))
-
-	h.logger.Debug(LogMsgProvisionComplete)
+	a.logger.Info(LogMsgStarted,
+		zap.String("portal_url", a.PortalURL))
 
 	return nil
 }
 
-func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	return next.ServeHTTP(w, r)
-}
+func (a *CertWebhookApp) Stop() error {
+	a.logger.Info(LogMsgStopping)
 
-func (h *WebhookHandler) Cleanup() error {
-	h.logger.Info(LogMsgCleaningUpCertWebhookHandler)
-
-	if h.delivery != nil {
-		h.delivery.Wait()
+	if a.delivery != nil {
+		a.delivery.Wait()
 	}
 
-	if h.portal != nil {
-		h.portal.Close()
+	if a.portal != nil {
+		a.portal.Close()
 	}
 
-	h.portal = nil
-	h.delivery = nil
-	h.eventsApp = nil
+	a.portal = nil
+	a.delivery = nil
+	a.eventsApp = nil
 
-	h.logger.Debug(LogMsgCleanupComplete)
-
+	a.logger.Info(LogMsgStopped)
 	return nil
 }
 
-func (h *WebhookHandler) sendWebhook(domain string, status SSLStatus, errorMsg, timestamp string) error {
-	if h.delivery == nil {
-		h.logger.Error(LogMsgWebhookDeliveryNotInitialized)
+func (a *CertWebhookApp) sendWebhook(domain string, status SSLStatus, errorMsg, timestamp string) error {
+	if a.delivery == nil {
+		a.logger.Error(LogMsgWebhookDeliveryNotInitialized)
 		return fmt.Errorf("webhook delivery not initialized")
 	}
 
-	h.logger.Debug("sending webhook",
+	a.logger.Debug("sending webhook",
 		zap.String("domain", domain),
 		zap.String("status", string(status)),
 		zap.String("timestamp", timestamp))
 
-	h.delivery.deliverAsync(domain, status, errorMsg, timestamp)
+	a.delivery.deliverAsync(domain, status, errorMsg, timestamp)
 	return nil
 }
