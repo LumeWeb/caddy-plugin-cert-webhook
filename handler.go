@@ -2,6 +2,8 @@ package certwebhook
 
 import (
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
@@ -17,16 +19,33 @@ const (
 	LogMsgStopping                     = "cert_webhook app stopping"
 	LogMsgStopped                      = "cert_webhook app stopped"
 	LogMsgWebhookDeliveryNotInitialized = "webhook delivery not initialized"
+	LogMsgWebhookThrottled             = "webhook throttled for domain"
 )
+
+const defaultThrottleInterval = 5 * time.Minute
+
+type lastSentEntry struct {
+	status SSLStatus
+	time   time.Time
+}
+
+type throttleMap struct {
+	mu       sync.Mutex
+	lastSent map[string]lastSentEntry
+	interval time.Duration
+}
 
 type CertWebhookApp struct {
 	Config `json:"-"`
 
-	logger    *zap.Logger
-	ctx       caddy.Context
-	portal    *PortalClient
-	delivery  *WebhookDelivery
-	eventsApp *caddyevents.App
+	logger           *zap.Logger
+	ctx              caddy.Context
+	portal           *PortalClient
+	delivery         *WebhookDelivery
+	eventsApp        *caddyevents.App
+	throttle         *throttleMap
+	throttleInterval time.Duration
+	certStatusFn     certStatusFunc
 }
 
 func (CertWebhookApp) CaddyModule() caddy.ModuleInfo {
@@ -42,9 +61,17 @@ func (a *CertWebhookApp) Provision(ctx caddy.Context) error {
 
 	a.Config.Provision()
 
+	a.throttleInterval = a.Config.throttleInterval()
+	a.throttle = &throttleMap{
+		lastSent: make(map[string]lastSentEntry),
+		interval: a.throttleInterval,
+	}
+	a.certStatusFn = defaultCertStatusFn
+
 	a.logger.Debug("config resolved",
 		zap.String("portal_url", a.PortalURL),
-		zap.Bool("gateway_secret_set", a.GatewaySecret != ""))
+		zap.Bool("gateway_secret_set", a.GatewaySecret != ""),
+		zap.Duration("throttle_interval", a.throttleInterval))
 
 	return a.Config.Validate()
 }
@@ -86,6 +113,7 @@ func (a *CertWebhookApp) Stop() error {
 	a.portal = nil
 	a.delivery = nil
 	a.eventsApp = nil
+	a.throttle = nil
 
 	a.logger.Info(LogMsgStopped)
 	return nil
@@ -102,6 +130,34 @@ func (a *CertWebhookApp) sendWebhook(domain string, status SSLStatus, errorMsg, 
 		zap.String("status", string(status)),
 		zap.String("timestamp", timestamp))
 
+	a.throttle.mark(domain, status)
 	a.delivery.deliverAsync(domain, status, errorMsg, timestamp)
 	return nil
+}
+
+func (a *CertWebhookApp) shouldSend(domain string, status SSLStatus) bool {
+	if a.throttle == nil {
+		return true
+	}
+	return a.throttle.shouldSend(domain, status)
+}
+
+func (tm *throttleMap) shouldSend(domain string, status SSLStatus) bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	last, ok := tm.lastSent[domain]
+	if !ok {
+		return true
+	}
+	if last.status != status {
+		return true
+	}
+	return time.Since(last.time) >= tm.interval
+}
+
+func (tm *throttleMap) mark(domain string, status SSLStatus) {
+	tm.mu.Lock()
+	tm.lastSent[domain] = lastSentEntry{status: status, time: time.Now()}
+	tm.mu.Unlock()
 }

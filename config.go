@@ -2,18 +2,21 @@ package certwebhook
 
 import (
 	"os"
+	"time"
 )
 
 const (
 	GatewaySecretHeader = "X-Gateway-Secret"
 
-	EnvGatewaySecret = "GATEWAY_SECRET"
-	EnvPortalURL     = "PORTAL_URL"
+	EnvGatewaySecret    = "GATEWAY_SECRET"
+	EnvPortalURL        = "PORTAL_URL"
+	EnvThrottleInterval = "THROTTLE_INTERVAL"
 )
 
 type Config struct {
-	PortalURL     string
-	GatewaySecret string
+	PortalURL        string
+	GatewaySecret    string
+	ThrottleInterval string
 }
 
 func (c *Config) Provision() {
@@ -23,6 +26,23 @@ func (c *Config) Provision() {
 	if c.GatewaySecret == "" {
 		c.GatewaySecret = os.Getenv(EnvGatewaySecret)
 	}
+	if c.ThrottleInterval == "" {
+		c.ThrottleInterval = os.Getenv(EnvThrottleInterval)
+	}
+}
+
+func (c *Config) throttleInterval() time.Duration {
+	if c.ThrottleInterval == "" {
+		return defaultThrottleInterval
+	}
+	d, err := time.ParseDuration(c.ThrottleInterval)
+	if err != nil {
+		return defaultThrottleInterval
+	}
+	if d <= 0 {
+		return defaultThrottleInterval
+	}
+	return d
 }
 
 func (c *Config) Validate() error {

@@ -102,6 +102,7 @@ func TestSSLStatusString(t *testing.T) {
 	}{
 		{SSLStatusReady, "ready"},
 		{SSLStatusFailed, "failed"},
+		{SSLStatusIssuing, "issuing"},
 	}
 
 	for _, tt := range tests {
