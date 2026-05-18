@@ -98,7 +98,7 @@ func TestHandle_TLSGetCertificate_Throttled(t *testing.T) {
 	mockSvc := servicemocks.NewMockWebsitesService(t)
 	app := newTestApp(t, mockSvc, nil)
 
-	app.throttle.mark("example.com", SSLStatusIssuing)
+	app.throttle.checkAndMark("example.com", SSLStatusIssuing)
 
 	err := app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
@@ -109,10 +109,11 @@ func TestHandle_TLSGetCertificate_StatusTransitionBypass(t *testing.T) {
 	mockSvc := servicemocks.NewMockWebsitesService(t)
 	app := newTestApp(t, mockSvc, nil)
 
-	app.throttle.mark("example.com", SSLStatusIssuing)
+	app.throttle.checkAndMark("example.com", SSLStatusIssuing)
 
 	expectStatus(t, mockSvc, "example.com", SSLStatusReady)
 
+	assert.True(t, app.shouldSend("example.com", SSLStatusReady))
 	ts := time.Now().Format(time.RFC3339)
 	err := app.sendWebhook("example.com", SSLStatusReady, "", ts)
 	assert.NoError(t, err)
@@ -125,6 +126,7 @@ func TestHandle_TLSGetCertificate_CertEventThrottledSameStatus(t *testing.T) {
 
 	expectStatus(t, mockSvc, "example.com", SSLStatusReady)
 
+	assert.True(t, app.shouldSend("example.com", SSLStatusReady))
 	ts := time.Now().Format(time.RFC3339)
 	err := app.sendWebhook("example.com", SSLStatusReady, "", ts)
 	assert.NoError(t, err)
@@ -155,26 +157,20 @@ func TestHandle_ReadyFailedReadyRoundTrip(t *testing.T) {
 		delivered = append(delivered, SSLStatus(req.Status))
 	}).Return(nil).Times(3)
 
-	// Step 1: ready
 	err := app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 
-	// Step 2: ready → failed must bypass throttle
-	assert.True(t, app.shouldSend("example.com", SSLStatusFailed))
 	app.certStatusFn = func(domain string) SSLStatus { return SSLStatusFailed }
 	err = app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 
-	// Step 3: failed → ready must bypass throttle
-	assert.True(t, app.shouldSend("example.com", SSLStatusReady))
 	app.certStatusFn = func(domain string) SSLStatus { return SSLStatusReady }
 	err = app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 
-	// Step 4: same status now throttled
 	assert.False(t, app.shouldSend("example.com", SSLStatusReady))
 
 	assert.Equal(t, []SSLStatus{SSLStatusReady, SSLStatusFailed, SSLStatusReady}, delivered)
@@ -194,21 +190,25 @@ func TestHandle_CertEventAndTLSGetCertRace(t *testing.T) {
 		mu.Lock()
 		delivered = append(delivered, SSLStatus(req.Status))
 		mu.Unlock()
-	}).Return(nil).Times(3)
+	}).Return(nil)
 
 	var wg sync.WaitGroup
 	wg.Add(3)
 
 	go func() {
 		defer wg.Done()
-		ts := time.Now().Format(time.RFC3339)
-		app.sendWebhook("example.com", SSLStatusReady, "", ts)
+		if app.shouldSend("example.com", SSLStatusReady) {
+			ts := time.Now().Format(time.RFC3339)
+			app.sendWebhook("example.com", SSLStatusReady, "", ts)
+		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		ts := time.Now().Format(time.RFC3339)
-		app.sendWebhook("example.com", SSLStatusFailed, "", ts)
+		if app.shouldSend("example.com", SSLStatusFailed) {
+			ts := time.Now().Format(time.RFC3339)
+			app.sendWebhook("example.com", SSLStatusFailed, "", ts)
+		}
 	}()
 
 	go func() {
@@ -221,8 +221,7 @@ func TestHandle_CertEventAndTLSGetCertRace(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	assert.Len(t, delivered, 3)
-	// Must contain at least one ready and one failed (transition always bypasses)
+	assert.GreaterOrEqual(t, len(delivered), 2)
 	hasReady := false
 	hasFailed := false
 	for _, s := range delivered {

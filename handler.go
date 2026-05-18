@@ -130,7 +130,6 @@ func (a *CertWebhookApp) sendWebhook(domain string, status SSLStatus, errorMsg, 
 		zap.String("status", string(status)),
 		zap.String("timestamp", timestamp))
 
-	a.throttle.mark(domain, status)
 	a.delivery.deliverAsync(domain, status, errorMsg, timestamp)
 	return nil
 }
@@ -139,25 +138,17 @@ func (a *CertWebhookApp) shouldSend(domain string, status SSLStatus) bool {
 	if a.throttle == nil {
 		return true
 	}
-	return a.throttle.shouldSend(domain, status)
+	return a.throttle.checkAndMark(domain, status)
 }
 
-func (tm *throttleMap) shouldSend(domain string, status SSLStatus) bool {
+func (tm *throttleMap) checkAndMark(domain string, status SSLStatus) bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	last, ok := tm.lastSent[domain]
-	if !ok {
+	if !ok || last.status != status || time.Since(last.time) >= tm.interval {
+		tm.lastSent[domain] = lastSentEntry{status: status, time: time.Now()}
 		return true
 	}
-	if last.status != status {
-		return true
-	}
-	return time.Since(last.time) >= tm.interval
-}
-
-func (tm *throttleMap) mark(domain string, status SSLStatus) {
-	tm.mu.Lock()
-	tm.lastSent[domain] = lastSentEntry{status: status, time: time.Now()}
-	tm.mu.Unlock()
+	return false
 }

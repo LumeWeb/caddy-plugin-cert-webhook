@@ -1,6 +1,7 @@
 package certwebhook
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -11,8 +12,8 @@ func TestThrottleMap_NoPriorSend(t *testing.T) {
 		interval: 5 * time.Minute,
 	}
 
-	if !tm.shouldSend("example.com", SSLStatusReady) {
-		t.Error("expected shouldSend=true for domain with no prior send")
+	if !tm.checkAndMark("example.com", SSLStatusReady) {
+		t.Error("expected checkAndMark=true for domain with no prior send")
 	}
 }
 
@@ -21,10 +22,10 @@ func TestThrottleMap_SameStatusWithinWindow(t *testing.T) {
 		lastSent: make(map[string]lastSentEntry),
 		interval: 5 * time.Minute,
 	}
-	tm.mark("example.com", SSLStatusReady)
+	tm.checkAndMark("example.com", SSLStatusReady)
 
-	if tm.shouldSend("example.com", SSLStatusReady) {
-		t.Error("expected shouldSend=false for same status within window")
+	if tm.checkAndMark("example.com", SSLStatusReady) {
+		t.Error("expected checkAndMark=false for same status within window")
 	}
 }
 
@@ -38,8 +39,8 @@ func TestThrottleMap_SameStatusAfterWindow(t *testing.T) {
 		time:   time.Now().Add(-6 * time.Minute),
 	}
 
-	if !tm.shouldSend("example.com", SSLStatusReady) {
-		t.Error("expected shouldSend=true for same status after window")
+	if !tm.checkAndMark("example.com", SSLStatusReady) {
+		t.Error("expected checkAndMark=true for same status after window")
 	}
 }
 
@@ -58,10 +59,10 @@ func TestThrottleMap_StatusTransitionAlwaysSends(t *testing.T) {
 			lastSent: make(map[string]lastSentEntry),
 			interval: 5 * time.Minute,
 		}
-		tm.mark("example.com", tc.from)
+		tm.checkAndMark("example.com", tc.from)
 
-		if !tm.shouldSend("example.com", tc.to) {
-			t.Errorf("expected shouldSend=true for status transition %s → %s", tc.from, tc.to)
+		if !tm.checkAndMark("example.com", tc.to) {
+			t.Errorf("expected checkAndMark=true for status transition %s → %s", tc.from, tc.to)
 		}
 	}
 }
@@ -71,21 +72,21 @@ func TestThrottleMap_DifferentDomains(t *testing.T) {
 		lastSent: make(map[string]lastSentEntry),
 		interval: 5 * time.Minute,
 	}
-	tm.mark("example.com", SSLStatusReady)
+	tm.checkAndMark("example.com", SSLStatusReady)
 
-	if !tm.shouldSend("other.com", SSLStatusReady) {
-		t.Error("expected shouldSend=true for different domain")
+	if !tm.checkAndMark("other.com", SSLStatusReady) {
+		t.Error("expected checkAndMark=true for different domain")
 	}
 }
 
-func TestThrottleMap_MarkRecordsStatusAndTime(t *testing.T) {
+func TestThrottleMap_CheckAndMarkRecordsStatusAndTime(t *testing.T) {
 	tm := &throttleMap{
 		lastSent: make(map[string]lastSentEntry),
 		interval: 5 * time.Minute,
 	}
 
 	before := time.Now()
-	tm.mark("example.com", SSLStatusReady)
+	tm.checkAndMark("example.com", SSLStatusReady)
 	after := time.Now()
 
 	entry := tm.lastSent["example.com"]
@@ -102,9 +103,9 @@ func TestThrottleMap_IssuingDoesNotBlockReady(t *testing.T) {
 		lastSent: make(map[string]lastSentEntry),
 		interval: 5 * time.Minute,
 	}
-	tm.mark("example.com", SSLStatusIssuing)
+	tm.checkAndMark("example.com", SSLStatusIssuing)
 
-	if !tm.shouldSend("example.com", SSLStatusReady) {
+	if !tm.checkAndMark("example.com", SSLStatusReady) {
 		t.Error("issuing should not block ready transition")
 	}
 }
@@ -118,19 +119,43 @@ func TestThrottleMap_ConcurrentSafety(t *testing.T) {
 	done := make(chan bool, 2)
 	go func() {
 		for i := 0; i < 100; i++ {
-			tm.shouldSend("example.com", SSLStatusReady)
-			tm.mark("example.com", SSLStatusReady)
+			tm.checkAndMark("example.com", SSLStatusReady)
 		}
 		done <- true
 	}()
 	go func() {
 		for i := 0; i < 100; i++ {
-			tm.shouldSend("example.com", SSLStatusIssuing)
-			tm.mark("example.com", SSLStatusIssuing)
+			tm.checkAndMark("example.com", SSLStatusIssuing)
 		}
 		done <- true
 	}()
 
 	<-done
 	<-done
+}
+
+func TestThrottleMap_CheckAndMarkAtomicNoTOCTOU(t *testing.T) {
+	tm := &throttleMap{
+		lastSent: make(map[string]lastSentEntry),
+		interval: 5 * time.Minute,
+	}
+
+	var wg sync.WaitGroup
+	sentCount := int64(0)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if tm.checkAndMark("example.com", SSLStatusReady) {
+				sentCount++
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if sentCount != 1 {
+		t.Errorf("expected exactly 1 send with atomic checkAndMark, got %d", sentCount)
+	}
 }
