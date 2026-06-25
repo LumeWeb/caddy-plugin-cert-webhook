@@ -63,7 +63,7 @@ func TestHandle_TLSGetCertificate_Issuing(t *testing.T) {
 
 	expectStatus(t, mockSvc, "example.com", SSLStatusIssuing)
 
-	err := app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
+	err := app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 }
@@ -76,7 +76,7 @@ func TestHandle_TLSGetCertificate_Ready(t *testing.T) {
 
 	expectStatus(t, mockSvc, "example.com", SSLStatusReady)
 
-	err := app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
+	err := app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 }
@@ -89,7 +89,7 @@ func TestHandle_TLSGetCertificate_Failed(t *testing.T) {
 
 	expectStatus(t, mockSvc, "example.com", SSLStatusFailed)
 
-	err := app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
+	err := app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 }
@@ -100,7 +100,7 @@ func TestHandle_TLSGetCertificate_Throttled(t *testing.T) {
 
 	app.throttle.checkAndMark("example.com", SSLStatusIssuing)
 
-	err := app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
+	err := app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 }
@@ -140,7 +140,7 @@ func TestHandle_TLSGetCertificate_EmptyData(t *testing.T) {
 	app := newTestApp(t, mockSvc, nil)
 
 	event := caddy.Event{Data: map[string]any{}}
-	err := app.handleTLSGetCertificateEvent(event)
+	err := app.handleTLSGetCertificateEvent(context.Background(), event)
 	assert.NoError(t, err)
 }
 
@@ -157,17 +157,17 @@ func TestHandle_ReadyFailedReadyRoundTrip(t *testing.T) {
 		delivered = append(delivered, SSLStatus(req.Status))
 	}).Return(nil).Times(3)
 
-	err := app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
+	err := app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 
 	app.certStatusFn = func(domain string) SSLStatus { return SSLStatusFailed }
-	err = app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
+	err = app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 
 	app.certStatusFn = func(domain string) SSLStatus { return SSLStatusReady }
-	err = app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
+	err = app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 
@@ -213,7 +213,7 @@ func TestHandle_CertEventAndTLSGetCertRace(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		app.handleTLSGetCertificateEvent(tlsGetCertEvent("example.com"))
+		app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("example.com"))
 	}()
 
 	wg.Wait()
