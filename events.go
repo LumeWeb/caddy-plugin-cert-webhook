@@ -8,6 +8,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 )
 
@@ -89,18 +90,26 @@ func (h *CertWebhookApp) subscribeToEvents(ctx caddy.Context) error {
 func (h *CertWebhookApp) Handle(ctx context.Context, data caddy.Event) error {
 	eventName := data.Name()
 
+	ctx, span := startSpan(ctx, "cert_webhook.handle_event",
+		attribute.String("event_type", eventName))
+	defer span.End()
+
 	switch eventName {
 	case EventCertObtained, EventCertRenewed, EventCertExpired:
-		return h.handleCertEvent(eventName, data)
+		return h.handleCertEvent(ctx, eventName, data)
 	case EventTLSGetCertificate:
-		return h.handleTLSGetCertificateEvent(data)
+		return h.handleTLSGetCertificateEvent(ctx, data)
 	default:
 		h.logger.Warn(LogMsgUnknownEventType, zap.String("event", eventName))
 		return nil
 	}
 }
 
-func (h *CertWebhookApp) handleCertEvent(eventType string, data caddy.Event) error {
+func (h *CertWebhookApp) handleCertEvent(ctx context.Context, eventType string, data caddy.Event) error {
+	ctx, span := startSpan(ctx, "cert_webhook.handle_cert_event",
+		attribute.String("event_type", eventType))
+	defer span.End()
+
 	h.logger.Debug("handling cert event", zap.String("event_type", eventType))
 
 	eventData, err := h.extractEventData(eventType, data)
@@ -124,8 +133,11 @@ func (h *CertWebhookApp) handleCertEvent(eventType string, data caddy.Event) err
 			zap.String("event_type", eventType),
 			zap.String("domain", eventData.Domain),
 			zap.String("status", string(status)))
+		recordThrottled(eventData.Domain, "cert_event")
 		return nil
 	}
+
+	recordCertEvent(eventType, eventData.Domain)
 
 	h.logger.Info(LogMsgCertificateEventProcessed,
 		zap.String("event_type", eventType),
@@ -136,7 +148,10 @@ func (h *CertWebhookApp) handleCertEvent(eventType string, data caddy.Event) err
 	return h.sendWebhook(eventData.Domain, status, eventData.Error, eventData.Timestamp)
 }
 
-func (h *CertWebhookApp) handleTLSGetCertificateEvent(data caddy.Event) error {
+func (h *CertWebhookApp) handleTLSGetCertificateEvent(ctx context.Context, data caddy.Event) error {
+	ctx, span := startSpan(ctx, "cert_webhook.handle_tls_get_cert")
+	defer span.End()
+
 	domain, err := extractDomainFromClientHello(data)
 	if err != nil {
 		h.logger.Debug("failed to extract domain from tls_get_certificate", zap.Error(err))
@@ -149,8 +164,11 @@ func (h *CertWebhookApp) handleTLSGetCertificateEvent(data caddy.Event) error {
 		h.logger.Debug(LogMsgTLSGetCertThrottled,
 			zap.String("domain", domain),
 			zap.String("status", string(status)))
+		recordThrottled(domain, "tls_get_cert")
 		return nil
 	}
+
+	recordTLSGetCert(domain, status)
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 

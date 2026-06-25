@@ -68,6 +68,9 @@ func (a *CertWebhookApp) Provision(ctx caddy.Context) error {
 	}
 	a.certStatusFn = defaultCertStatusFn
 
+	initMetrics(a.ctx.GetMetricsRegistry())
+	initTracer()
+
 	a.logger.Debug("config resolved",
 		zap.String("portal_url", a.PortalURL),
 		zap.Bool("gateway_secret_set", a.GatewaySecret != ""),

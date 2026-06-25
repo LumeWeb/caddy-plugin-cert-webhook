@@ -1,12 +1,12 @@
 package certwebhook
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	ipfs "go.lumeweb.com/ipfs-sdk"
 	servicemocks "go.lumeweb.com/ipfs-sdk/mocks/services"
 	"go.uber.org/zap"
@@ -22,7 +22,7 @@ func TestWebhookDelivery_FullIntegration(t *testing.T) {
 
 		ts := time.Now().Format(time.RFC3339)
 		mockSvc.EXPECT().UpdateSSLStatusInternal(
-			context.Background(),
+			mock.Anything,
 			"example.com",
 			ipfs.SSLStatusUpdateRequest{
 				Status:    string(SSLStatusReady),
@@ -43,7 +43,7 @@ func TestWebhookDelivery_FullIntegration(t *testing.T) {
 		ts := time.Now().Format(time.RFC3339)
 		errorMsg := "certificate validation failed"
 		mockSvc.EXPECT().UpdateSSLStatusInternal(
-			context.Background(),
+			mock.Anything,
 			"example.com",
 			ipfs.SSLStatusUpdateRequest{
 				Status:    string(SSLStatusFailed),
@@ -64,7 +64,7 @@ func TestWebhookDelivery_FullIntegration(t *testing.T) {
 
 		ts := time.Now().Format(time.RFC3339)
 		mockSvc.EXPECT().UpdateSSLStatusInternal(
-			context.Background(),
+			mock.Anything,
 			"example.com",
 			ipfs.SSLStatusUpdateRequest{
 				Status:    string(SSLStatusReady),
@@ -95,7 +95,7 @@ func TestWebhookDelivery_FullIntegration(t *testing.T) {
 			ts := time.Now().Format(time.RFC3339)
 			d := domain
 			mockSvc.EXPECT().UpdateSSLStatusInternal(
-				context.Background(),
+				mock.Anything,
 				d,
 				ipfs.SSLStatusUpdateRequest{
 					Status:    string(SSLStatusReady),
