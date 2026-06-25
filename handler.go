@@ -73,7 +73,18 @@ func (a *CertWebhookApp) Provision(ctx caddy.Context) error {
 		zap.Bool("gateway_secret_set", a.GatewaySecret != ""),
 		zap.Duration("throttle_interval", a.throttleInterval))
 
-	return a.Config.Validate()
+	if err := a.Config.Validate(); err != nil {
+		return err
+	}
+
+	// Subscribe to events during provisioning, before the events app starts.
+	// Caddy's event bus rejects new subscriptions after Start() is called.
+	if err := a.subscribeToEvents(ctx); err != nil {
+		a.logger.Error(LogMsgFailedToSubscribeToEvents, zap.Error(err))
+		return err
+	}
+
+	return nil
 }
 
 func (a *CertWebhookApp) Start() error {
@@ -87,11 +98,6 @@ func (a *CertWebhookApp) Start() error {
 	a.portal = portal
 
 	a.delivery = NewWebhookDelivery(a.portal.Websites(), a.logger)
-
-	if err := a.subscribeToEvents(a.ctx); err != nil {
-		a.logger.Error(LogMsgFailedToSubscribeToEvents, zap.Error(err))
-		return err
-	}
 
 	a.logger.Info(LogMsgStarted,
 		zap.String("portal_url", a.PortalURL))
