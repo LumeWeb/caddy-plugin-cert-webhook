@@ -2,6 +2,7 @@ package certwebhook
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -11,15 +12,16 @@ import (
 )
 
 const (
-	LogMsgConfigValidationFailed       = "configuration validation failed"
-	LogMsgFailedToSubscribeToEvents    = "failed to subscribe to events"
-	LogMsgFailedToCreatePortalClient   = "failed to create portal client"
-	LogMsgStarting                     = "cert_webhook app starting"
-	LogMsgStarted                      = "cert_webhook app started"
-	LogMsgStopping                     = "cert_webhook app stopping"
-	LogMsgStopped                      = "cert_webhook app stopped"
+	LogMsgConfigValidationFailed        = "configuration validation failed"
+	LogMsgFailedToSubscribeToEvents     = "failed to subscribe to events"
+	LogMsgFailedToCreatePortalClient    = "failed to create portal client"
+	LogMsgStarting                      = "cert_webhook app starting"
+	LogMsgStarted                       = "cert_webhook app started"
+	LogMsgStopping                      = "cert_webhook app stopping"
+	LogMsgStopped                       = "cert_webhook app stopped"
 	LogMsgWebhookDeliveryNotInitialized = "webhook delivery not initialized"
-	LogMsgWebhookThrottled             = "webhook throttled for domain"
+	LogMsgWebhookThrottled              = "webhook throttled for domain"
+	LogMsgSkippingIPAddress             = "skipping webhook for IP address"
 )
 
 const defaultThrottleInterval = 5 * time.Minute
@@ -129,6 +131,12 @@ func (a *CertWebhookApp) Stop() error {
 }
 
 func (a *CertWebhookApp) sendWebhook(domain string, status SSLStatus, errorMsg, timestamp string) error {
+	if shouldSkipDomain(domain) {
+		a.logger.Debug(LogMsgSkippingIPAddress,
+			zap.String("domain", domain))
+		return nil
+	}
+
 	if a.delivery == nil {
 		a.logger.Error(LogMsgWebhookDeliveryNotInitialized)
 		return fmt.Errorf("webhook delivery not initialized")
@@ -141,6 +149,14 @@ func (a *CertWebhookApp) sendWebhook(domain string, status SSLStatus, errorMsg, 
 
 	a.delivery.deliverAsync(domain, status, errorMsg, timestamp)
 	return nil
+}
+
+// shouldSkipDomain returns true for raw IP addresses. Caddy issues certs
+// for the gateway's listen address (e.g. 104.243.38.32) and the cert_webhook
+// would otherwise fire a webhook to the portal, which 404s because there's no
+// website record for an IP.
+func shouldSkipDomain(domain string) bool {
+	return net.ParseIP(domain) != nil
 }
 
 func (a *CertWebhookApp) shouldSend(domain string, status SSLStatus) bool {
