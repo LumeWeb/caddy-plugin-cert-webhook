@@ -256,3 +256,72 @@ func TestCertStatusFn_MockedFailed(t *testing.T) {
 	fn := func(domain string) SSLStatus { return SSLStatusFailed }
 	assert.Equal(t, SSLStatusFailed, fn("example.com"))
 }
+
+func TestShouldSkipDomain_IPv4(t *testing.T) {
+	assert.True(t, shouldSkipDomain("104.243.38.32"))
+}
+
+func TestShouldSkipDomain_IPv6(t *testing.T) {
+	assert.True(t, shouldSkipDomain("::1"))
+}
+
+func TestShouldSkipDomain_Domain(t *testing.T) {
+	assert.False(t, shouldSkipDomain("example.com"))
+}
+
+func TestShouldSkipDomain_EmptyString(t *testing.T) {
+	assert.False(t, shouldSkipDomain(""))
+}
+
+func TestSendWebhook_SkipsIPAddress(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	app := newTestApp(t, mockSvc, nil)
+
+	ts := time.Now().Format(time.RFC3339)
+	err := app.sendWebhook("104.243.38.32", SSLStatusReady, "", ts)
+	assert.NoError(t, err)
+	app.delivery.Wait()
+
+	mockSvc.AssertNotCalled(t, "UpdateSSLStatusInternal")
+}
+
+func TestSendWebhook_DomainNotSkipped(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	app := newTestApp(t, mockSvc, func(domain string) SSLStatus {
+		return SSLStatusReady
+	})
+
+	expectStatus(t, mockSvc, "example.com", SSLStatusReady)
+
+	ts := time.Now().Format(time.RFC3339)
+	err := app.sendWebhook("example.com", SSLStatusReady, "", ts)
+	assert.NoError(t, err)
+	app.delivery.Wait()
+}
+
+func TestHandle_TLSGetCertificate_SkipsIP(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	app := newTestApp(t, mockSvc, nil)
+
+	err := app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("104.243.38.32"))
+	assert.NoError(t, err)
+	app.delivery.Wait()
+
+	mockSvc.AssertNotCalled(t, "UpdateSSLStatusInternal")
+}
+
+func TestHandle_CertEvent_SkipsIP(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	app := newTestApp(t, mockSvc, nil)
+
+	err := app.handleCertEvent(context.Background(), EventCertObtained, caddy.Event{
+		Data: map[string]any{
+			"domain":    "104.243.38.32",
+			"timestamp": float64(time.Now().Unix()),
+		},
+	})
+	assert.NoError(t, err)
+	app.delivery.Wait()
+
+	mockSvc.AssertNotCalled(t, "UpdateSSLStatusInternal")
+}
