@@ -22,6 +22,7 @@ const (
 	LogMsgWebhookDeliveryNotInitialized = "webhook delivery not initialized"
 	LogMsgWebhookThrottled              = "webhook throttled for domain"
 	LogMsgSkippingIPAddress             = "skipping webhook for IP address"
+	LogMsgSkippingIgnoredDomain         = "skipping webhook for ignored domain"
 )
 
 const defaultThrottleInterval = 5 * time.Minute
@@ -48,6 +49,7 @@ type CertWebhookApp struct {
 	throttle         *throttleMap
 	throttleInterval time.Duration
 	certStatusFn     certStatusFunc
+	ignoredDomains   map[string]struct{}
 }
 
 func (CertWebhookApp) CaddyModule() caddy.ModuleInfo {
@@ -70,13 +72,19 @@ func (a *CertWebhookApp) Provision(ctx caddy.Context) error {
 	}
 	a.certStatusFn = defaultCertStatusFn
 
+	a.ignoredDomains = make(map[string]struct{}, len(a.IgnoredDomains))
+	for _, d := range a.IgnoredDomains {
+		a.ignoredDomains[d] = struct{}{}
+	}
+
 	initMetrics(a.ctx.GetMetricsRegistry())
 	initTracer()
 
 	a.logger.Debug("config resolved",
 		zap.String("portal_url", a.PortalURL),
 		zap.Bool("gateway_secret_set", a.GatewaySecret != ""),
-		zap.Duration("throttle_interval", a.throttleInterval))
+		zap.Duration("throttle_interval", a.throttleInterval),
+		zap.Strings("ignored_domains", a.IgnoredDomains))
 
 	if err := a.Config.Validate(); err != nil {
 		return err
@@ -131,8 +139,13 @@ func (a *CertWebhookApp) Stop() error {
 }
 
 func (a *CertWebhookApp) sendWebhook(domain string, status SSLStatus, errorMsg, timestamp string) error {
-	if shouldSkipDomain(domain) {
+	if isIPAddress(domain) {
 		a.logger.Debug(LogMsgSkippingIPAddress,
+			zap.String("domain", domain))
+		return nil
+	}
+	if _, ok := a.ignoredDomains[domain]; ok {
+		a.logger.Debug(LogMsgSkippingIgnoredDomain,
 			zap.String("domain", domain))
 		return nil
 	}
@@ -151,11 +164,11 @@ func (a *CertWebhookApp) sendWebhook(domain string, status SSLStatus, errorMsg, 
 	return nil
 }
 
-// shouldSkipDomain returns true for raw IP addresses. Caddy issues certs
+// isIPAddress returns true for raw IP addresses. Caddy issues certs
 // for the gateway's listen address (e.g. 104.243.38.32) and the cert_webhook
 // would otherwise fire a webhook to the portal, which 404s because there's no
 // website record for an IP.
-func shouldSkipDomain(domain string) bool {
+func isIPAddress(domain string) bool {
 	return net.ParseIP(domain) != nil
 }
 

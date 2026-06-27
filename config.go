@@ -2,6 +2,7 @@ package certwebhook
 
 import (
 	"os"
+	"strings"
 	"time"
 )
 
@@ -11,12 +12,14 @@ const (
 	EnvGatewaySecret    = "GATEWAY_SECRET"
 	EnvPortalURL        = "PORTAL_URL"
 	EnvThrottleInterval = "THROTTLE_INTERVAL"
+	EnvIgnoredDomains   = "IGNORED_DOMAINS"
 )
 
 type Config struct {
 	PortalURL        string
 	GatewaySecret    string
 	ThrottleInterval string
+	IgnoredDomains   []string
 }
 
 func (c *Config) Provision() {
@@ -28,6 +31,9 @@ func (c *Config) Provision() {
 	}
 	if c.ThrottleInterval == "" {
 		c.ThrottleInterval = os.Getenv(EnvThrottleInterval)
+	}
+	if c.IgnoredDomains == nil {
+		c.IgnoredDomains = parseDomainList(os.Getenv(EnvIgnoredDomains))
 	}
 }
 
@@ -62,4 +68,19 @@ type ConfigError struct {
 
 func (e *ConfigError) Error() string {
 	return e.Message
+}
+
+func parseDomainList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }

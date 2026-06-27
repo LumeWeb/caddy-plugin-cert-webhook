@@ -257,20 +257,20 @@ func TestCertStatusFn_MockedFailed(t *testing.T) {
 	assert.Equal(t, SSLStatusFailed, fn("example.com"))
 }
 
-func TestShouldSkipDomain_IPv4(t *testing.T) {
-	assert.True(t, shouldSkipDomain("104.243.38.32"))
+func TestIsIPAddress_IPv4(t *testing.T) {
+	assert.True(t, isIPAddress("104.243.38.32"))
 }
 
-func TestShouldSkipDomain_IPv6(t *testing.T) {
-	assert.True(t, shouldSkipDomain("::1"))
+func TestIsIPAddress_IPv6(t *testing.T) {
+	assert.True(t, isIPAddress("::1"))
 }
 
-func TestShouldSkipDomain_Domain(t *testing.T) {
-	assert.False(t, shouldSkipDomain("example.com"))
+func TestIsIPAddress_Domain(t *testing.T) {
+	assert.False(t, isIPAddress("example.com"))
 }
 
-func TestShouldSkipDomain_EmptyString(t *testing.T) {
-	assert.False(t, shouldSkipDomain(""))
+func TestIsIPAddress_EmptyString(t *testing.T) {
+	assert.False(t, isIPAddress(""))
 }
 
 func TestSendWebhook_SkipsIPAddress(t *testing.T) {
@@ -320,6 +320,46 @@ func TestHandle_CertEvent_SkipsIP(t *testing.T) {
 			"timestamp": float64(time.Now().Unix()),
 		},
 	})
+	assert.NoError(t, err)
+	app.delivery.Wait()
+
+	mockSvc.AssertNotCalled(t, "UpdateSSLStatusInternal")
+}
+
+func TestSendWebhook_SkipsIgnoredDomain(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	app := newTestApp(t, mockSvc, nil)
+	app.ignoredDomains = map[string]struct{}{"gateway.example.com": {}}
+
+	ts := time.Now().Format(time.RFC3339)
+	err := app.sendWebhook("gateway.example.com", SSLStatusReady, "", ts)
+	assert.NoError(t, err)
+	app.delivery.Wait()
+
+	mockSvc.AssertNotCalled(t, "UpdateSSLStatusInternal")
+}
+
+func TestSendWebhook_NonIgnoredDomainNotSkipped(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	app := newTestApp(t, mockSvc, func(domain string) SSLStatus {
+		return SSLStatusReady
+	})
+	app.ignoredDomains = map[string]struct{}{"gateway.example.com": {}}
+
+	expectStatus(t, mockSvc, "example.com", SSLStatusReady)
+
+	ts := time.Now().Format(time.RFC3339)
+	err := app.sendWebhook("example.com", SSLStatusReady, "", ts)
+	assert.NoError(t, err)
+	app.delivery.Wait()
+}
+
+func TestHandle_TLSGetCertificate_SkipsIgnoredDomain(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	app := newTestApp(t, mockSvc, nil)
+	app.ignoredDomains = map[string]struct{}{"gateway.example.com": {}}
+
+	err := app.handleTLSGetCertificateEvent(context.Background(), tlsGetCertEvent("gateway.example.com"))
 	assert.NoError(t, err)
 	app.delivery.Wait()
 
