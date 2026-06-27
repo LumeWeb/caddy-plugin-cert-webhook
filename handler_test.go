@@ -365,3 +365,16 @@ func TestHandle_TLSGetCertificate_SkipsIgnoredDomain(t *testing.T) {
 
 	mockSvc.AssertNotCalled(t, "UpdateSSLStatusInternal")
 }
+
+func TestSendWebhook_IgnoredDomainCaseInsensitive(t *testing.T) {
+	mockSvc := servicemocks.NewMockWebsitesService(t)
+	app := newTestApp(t, mockSvc, nil)
+	app.ignoredDomains = map[string]struct{}{"gateway.example.com": {}}
+
+	ts := time.Now().Format(time.RFC3339)
+	err := app.sendWebhook("GATEWAY.Example.com", SSLStatusReady, "", ts)
+	assert.NoError(t, err)
+	app.delivery.Wait()
+
+	mockSvc.AssertNotCalled(t, "UpdateSSLStatusInternal")
+}

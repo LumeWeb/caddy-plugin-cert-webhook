@@ -3,6 +3,7 @@ package certwebhook
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,7 +75,7 @@ func (a *CertWebhookApp) Provision(ctx caddy.Context) error {
 
 	a.ignoredDomains = make(map[string]struct{}, len(a.IgnoredDomains))
 	for _, d := range a.IgnoredDomains {
-		a.ignoredDomains[d] = struct{}{}
+		a.ignoredDomains[strings.ToLower(d)] = struct{}{}
 	}
 
 	initMetrics(a.ctx.GetMetricsRegistry())
@@ -144,7 +145,7 @@ func (a *CertWebhookApp) sendWebhook(domain string, status SSLStatus, errorMsg, 
 			zap.String("domain", domain))
 		return nil
 	}
-	if _, ok := a.ignoredDomains[domain]; ok {
+	if _, ok := a.ignoredDomains[strings.ToLower(domain)]; ok {
 		a.logger.Debug(LogMsgSkippingIgnoredDomain,
 			zap.String("domain", domain))
 		return nil
