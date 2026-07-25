@@ -1,13 +1,16 @@
 package certwebhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 )
@@ -137,6 +140,25 @@ func (h *CertWebhookApp) handleCertEvent(ctx context.Context, eventType string, 
 		return nil
 	}
 
+	// HNS domain: push cert to portal for TLSA computation
+	if IsHNSDomain(eventData.Domain) && h.hnsManager != nil {
+		certPEM, err := h.extractCertPEM(eventData.Domain)
+		if err != nil {
+			h.logger.Warn("failed to extract cert for HNS domain",
+				zap.String("domain", eventData.Domain),
+				zap.Error(err))
+		} else {
+			go func(d, cert string) {
+				_, err := h.hnsManager.PushCert(context.Background(), d, cert)
+				if err != nil {
+					h.logger.Error("HNS cert push failed",
+						zap.String("domain", d),
+						zap.Error(err))
+				}
+			}(eventData.Domain, certPEM)
+		}
+	}
+
 	recordCertEvent(eventType, eventData.Domain)
 
 	h.logger.Info(LogMsgCertificateEventProcessed,
@@ -256,3 +278,25 @@ func decodeJSON(data map[string]any, target any) error {
 	}
 	return json.Unmarshal(jsonBytes, target)
 }
+
+// extractCertPEM extracts the certificate PEM from certmagic cache for a domain.
+func (h *CertWebhookApp) extractCertPEM(domain string) (string, error) {
+	certs := caddytls.AllMatchingCertificates(domain)
+	if len(certs) == 0 {
+		return "", fmt.Errorf("no certificates found for domain: %s", domain)
+	}
+
+	for _, cert := range certs {
+		if cert.Leaf == nil {
+			continue
+		}
+		var buf bytes.Buffer
+		if err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Leaf.Raw}); err != nil {
+			continue
+		}
+		return buf.String(), nil
+	}
+
+	return "", fmt.Errorf("no valid certificate PEM for domain: %s", domain)
+}
+

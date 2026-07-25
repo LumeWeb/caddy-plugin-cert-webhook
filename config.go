@@ -13,6 +13,7 @@ const (
 	EnvPortalURL        = "PORTAL_URL"
 	EnvThrottleInterval = "THROTTLE_INTERVAL"
 	EnvIgnoredDomains   = "IGNORED_DOMAINS"
+	EnvHNSGatewayDomain = "HNS_GATEWAY_DOMAIN"
 )
 
 type Config struct {
@@ -20,6 +21,7 @@ type Config struct {
 	GatewaySecret    string
 	ThrottleInterval string
 	IgnoredDomains   []string
+	HNSGatewayDomain string
 }
 
 func (c *Config) Provision() {
@@ -34,6 +36,9 @@ func (c *Config) Provision() {
 	}
 	if c.IgnoredDomains == nil {
 		c.IgnoredDomains = parseDomainList(os.Getenv(EnvIgnoredDomains))
+	}
+	if c.HNSGatewayDomain == "" {
+		c.HNSGatewayDomain = os.Getenv(EnvHNSGatewayDomain)
 	}
 }
 

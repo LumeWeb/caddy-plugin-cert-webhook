@@ -46,6 +46,7 @@ type CertWebhookApp struct {
 	ctx              caddy.Context
 	portal           *PortalClient
 	delivery         *WebhookDelivery
+	hnsManager       *HNSCertManager
 	eventsApp        *caddyevents.App
 	throttle         *throttleMap
 	throttleInterval time.Duration
@@ -112,6 +113,9 @@ func (a *CertWebhookApp) Start() error {
 	a.portal = portal
 
 	a.delivery = NewWebhookDelivery(a.portal.Websites(), a.logger)
+
+	// HNS cert manager for alt-root TLSA
+	a.hnsManager = NewHNSCertManager(a.PortalURL, a.GatewaySecret, a.logger)
 
 	a.logger.Info(LogMsgStarted,
 		zap.String("portal_url", a.PortalURL))
