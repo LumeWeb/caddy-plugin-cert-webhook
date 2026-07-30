@@ -46,6 +46,8 @@ type CertWebhookApp struct {
 	ctx              caddy.Context
 	portal           *PortalClient
 	delivery         *WebhookDelivery
+	daneManager      *DANECertManager
+	daneChecker      *DANEChecker
 	eventsApp        *caddyevents.App
 	throttle         *throttleMap
 	throttleInterval time.Duration
@@ -113,6 +115,10 @@ func (a *CertWebhookApp) Start() error {
 
 	a.delivery = NewWebhookDelivery(a.portal.Websites(), a.logger)
 
+	// DANE cert manager for alt-root TLSA — uses SDK's DNS service
+	a.daneManager = NewDANECertManager(a.portal.DNS(), a.logger)
+	a.daneChecker = NewDANEChecker(a.portal.Websites())
+
 	a.logger.Info(LogMsgStarted,
 		zap.String("portal_url", a.PortalURL))
 
@@ -172,7 +178,15 @@ func (a *CertWebhookApp) sendWebhook(domain string, status SSLStatus, errorMsg, 
 func isIPAddress(domain string) bool {
 	return net.ParseIP(domain) != nil
 }
+// shouldDANEPush returns false if the domain is in the ignored set.
+func (a *CertWebhookApp) shouldDANEPush(domain string) bool {
+	if _, ok := a.ignoredDomains[strings.ToLower(domain)]; ok {
+		return false
+	}
+	return true
+}
 
+// shouldSend returns true if the webhook should be sent for this domain/status.
 func (a *CertWebhookApp) shouldSend(domain string, status SSLStatus) bool {
 	if a.throttle == nil {
 		return true

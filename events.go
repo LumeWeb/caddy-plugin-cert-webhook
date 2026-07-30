@@ -1,13 +1,16 @@
 package certwebhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 )
@@ -137,6 +140,47 @@ func (h *CertWebhookApp) handleCertEvent(ctx context.Context, eventType string, 
 		return nil
 	}
 
+	// DANE domain: push cert to portal for TLSA computation
+	// Only push on cert issuance/renewal, not expiry.
+	// Skip ignored domains and IP addresses.
+	if eventType != EventCertExpired &&
+		h.daneChecker != nil && h.daneManager != nil &&
+		!isIPAddress(eventData.Domain) &&
+		h.shouldDANEPush(eventData.Domain) {
+		isDANE, namespace, daneErr := h.daneChecker.IsDANEDomain(ctx, eventData.Domain)
+		if daneErr != nil {
+			h.logger.Debug("failed to check DANE status",
+				zap.String("domain", eventData.Domain),
+				zap.Error(daneErr))
+		}
+		if isDANE {
+			certPEM, err := h.extractCertPEM(eventData.Domain)
+			if err != nil {
+				h.logger.Warn("failed to extract cert for DANE domain",
+					zap.String("domain", eventData.Domain),
+					zap.Error(err))
+			} else {
+				go func(d, ns, cert string) {
+					defer func() {
+						if r := recover(); r != nil {
+							h.logger.Error("DANE cert push panicked",
+								zap.String("domain", d),
+								zap.Any("recover", r))
+						}
+					}()
+					pushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					_, err := h.daneManager.PushCert(pushCtx, d, ns, cert)
+					if err != nil {
+						h.logger.Error("DANE cert push failed",
+							zap.String("domain", d),
+							zap.Error(err))
+					}
+				}(eventData.Domain, namespace, certPEM)
+			}
+		}
+	}
+
 	recordCertEvent(eventType, eventData.Domain)
 
 	h.logger.Info(LogMsgCertificateEventProcessed,
@@ -256,3 +300,25 @@ func decodeJSON(data map[string]any, target any) error {
 	}
 	return json.Unmarshal(jsonBytes, target)
 }
+
+// extractCertPEM extracts the certificate PEM from certmagic cache for a domain.
+func (h *CertWebhookApp) extractCertPEM(domain string) (string, error) {
+	certs := caddytls.AllMatchingCertificates(domain)
+	if len(certs) == 0 {
+		return "", fmt.Errorf("no certificates found for domain: %s", domain)
+	}
+
+	for _, cert := range certs {
+		if cert.Leaf == nil {
+			continue
+		}
+		var buf bytes.Buffer
+		if err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Leaf.Raw}); err != nil {
+			continue
+		}
+		return buf.String(), nil
+	}
+
+	return "", fmt.Errorf("no valid certificate PEM for domain: %s", domain)
+}
+
