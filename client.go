@@ -43,6 +43,10 @@ func (c *PortalClient) Websites() ipfs.WebsitesService {
 	return c.websites
 }
 
+func (c *PortalClient) DNS() ipfs.DNSService {
+	return c.client.DNS()
+}
+
 func (c *PortalClient) Close() {
 	c.client = nil
 	c.websites = nil
