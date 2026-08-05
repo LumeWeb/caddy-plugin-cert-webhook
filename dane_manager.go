@@ -155,24 +155,16 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 		return nil, nil
 	}
 
-	// Check cert cache first
+	// Check cert cache first. Note: we do NOT evict an expired entry here. The
+	// singleflight closure below re-reads the map and captures the reusable key
+	// at closure-execution time, so the singleflight winner always sees whatever
+	// the cache holds (including a concurrent caller's freshly regenerated entry)
+	// and never falls back to an empty key.
 	d.mu.RLock()
 	cached, ok := d.certs[domain]
 	d.mu.RUnlock()
-
-	// Carried across the renewal so the key can be reused locally (no portal
-	// round-trip) once the singleflight regenerates the cert.
-	var cachedKeyPEM string
 	if ok && time.Now().Before(cached.expiry) {
 		return cached.tlsCert, nil
-	}
-	if ok {
-		// Preserve the key before evicting the expired entry; the renewal below
-		// re-issues from it to keep the SPKI (TLSA) stable.
-		cachedKeyPEM = cached.keyPEM
-		d.mu.Lock()
-		delete(d.certs, domain)
-		d.mu.Unlock()
 	}
 
 	// Check DANE status cache before hitting the portal
@@ -204,14 +196,19 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 
 	// Use singleflight to deduplicate concurrent cert generation per domain
 	val, err, _ := d.sf.Do("cert:"+domain, func() (any, error) {
-		// Double-check cert cache after acquiring singleflight (another caller may
-		// have populated it). The key survives eviction via the outer cachedKeyPEM,
-		// so the re-issue happens locally with no portal round-trip.
+		// Double-check cache after acquiring singleflight, and capture the reusable
+		// key at closure-execution time so the singleflight winner reads whatever
+		// the cache holds (a concurrent caller may have regenerated it). This avoids
+		// both an empty-key portal round-trip and SPKI/TLSA churn on renewal.
 		d.mu.RLock()
 		cached, ok := d.certs[domain]
 		d.mu.RUnlock()
+		var cachedKeyPEM string
 		if ok && time.Now().Before(cached.expiry) {
 			return cached.tlsCert, nil
+		}
+		if ok {
+			cachedKeyPEM = cached.keyPEM
 		}
 
 		certPEM, keyPEM, reusedKey, err := d.issueCertForKey(domain, namespace, cachedKeyPEM)

@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -270,6 +272,101 @@ func TestDANECertGetter_GetCertificate_CorruptPersistedKeyFallsBack(t *testing.T
 	require.NotNil(t, cert, "must fall back to a fresh cert instead of failing the handshake")
 	require.NotNil(t, cert.Leaf)
 	assert.Contains(t, cert.Leaf.DNSNames, "example")
+}
+
+func TestDANECertGetter_GetCertificate_ConcurrentExpiryReusesKey(t *testing.T) {
+	// Regression for a concurrency race: at the 24h expiry boundary, concurrent
+	// renewals must all reuse the cached key (captured at singleflight-execution
+	// time) and must NOT each fall back to the portal or a fresh key. Otherwise
+	// SPKI/TLSA churn + handshake stalls occur.
+	keyPEM, _, err := GenerateSelfSignedForDANE("example")
+	require.NoError(t, err)
+
+	// Track how many portal GetCert calls occur.
+	var getCertCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/internal/dns/delegation/example":
+			resp := map[string]string{"domain": "example", "namespace": NamespaceHNS, "status": "active"}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(resp)
+		case r.URL.Path == "/internal/dns/cert" && r.Method == http.MethodPost:
+			resp := map[string]any{"ok": true, "tlsa": "3 1 1 deadbeef", "owner_name": "_443._tcp.example."}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(resp)
+		case r.URL.Path == "/internal/dns/cert/example" && r.Method == http.MethodGet:
+			getCertCalls.Add(1)
+			// Delay to widen the race window.
+			time.Sleep(50 * time.Millisecond)
+			resp := map[string]any{"ok": true, "domain": "example", "namespace": NamespaceHNS,
+				"private_key_pem": keyPEM, "cert_pem": "ignored", "tlsa": "3 1 1 deadbeef"}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	// Generate a valid cert pair once so we can pre-seed a cache entry with a key.
+	seedCert, seedKey, err := GenerateSelfSignedForDANE("example")
+	require.NoError(t, err)
+	tlsSeed, err := tls.X509KeyPair([]byte(seedCert), []byte(seedKey))
+	require.NoError(t, err)
+
+	d := &DANECertGetter{
+		logger:         zap.NewNop(),
+		PortalURL:      server.URL,
+		GatewaySecret:  fmt.Sprintf("gw-%d", time.Now().UnixNano()),
+		certs:          make(map[string]*daneCachedCert),
+		statusCache:    make(map[string]*daneStatusEntry),
+		statusCacheTTL: daneStatusCacheTTLDefault,
+		pusher:         newTestDANEManager(t, server.URL),
+		checker:        NewDANEChecker(nil),
+	}
+
+	// Pre-seed an EXPIRED cache entry carrying the key, simulating a renewal that
+	// is due. cacheDANEStatus so the delegation check is skipped on the hot path.
+	d.cacheDANEStatus("example", true, NamespaceHNS)
+	d.certs["example"] = &daneCachedCert{
+		tlsCert: &tlsSeed,
+		keyPEM:  seedKey,
+		expiry:  time.Now().Add(-time.Minute), // already expired
+	}
+
+	// Fire many concurrent renewals at the expiry boundary.
+	const n = 8
+	var wg sync.WaitGroup
+	spkis := make([]string, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			hello := &tls.ClientHelloInfo{ServerName: "example"}
+			cert, cerr := d.GetCertificate(context.Background(), hello)
+			errs[i] = cerr
+			if cert != nil && cert.Leaf != nil {
+				spkis[i] = dane.ComputeTLSAFromSPKI(cert.Leaf.RawSubjectPublicKeyInfo)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, e := range errs {
+		require.NoError(t, e, "call %d", i)
+		require.NotEmpty(t, spkis[i], "call %d returned a cert with no leaf", i)
+	}
+	// All renewals must yield the same SPKI (no churn).
+	first := spkis[0]
+	for i := 1; i < n; i++ {
+		assert.Equal(t, first, spkis[i], "concurrent renewals must not churn the SPKI/TLSA")
+	}
+	// The cached key is reused locally; the portal must be consulted at most once
+	// (first bootstrap), not once per concurrent caller.
+	assert.LessOrEqual(t, getCertCalls.Load(), int32(1), "expired entry's key should be reused locally, not re-fetched per caller")
 }
 
 // spkiHashFromKeyPEM parses a PEM-encoded private key and returns the DANE
