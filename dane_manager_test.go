@@ -2,8 +2,11 @@ package certwebhook
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +15,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.lumeweb.com/dane"
 	"go.uber.org/zap"
 )
 
@@ -165,6 +169,92 @@ func TestDANECertGetter_GetCertificate_ExpiredCacheRegenerates(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, cert, "should regenerate cert after cache expiry")
+}
+
+func TestDANECertGetter_GetCertificate_ReusesPersistedKey(t *testing.T) {
+	// Generate a known key; the portal returns it via GET /internal/dns/cert/{domain}.
+	// The re-issued cert must be derived from that SAME key (stable SPKI), so a
+	// subsequent renewal does not change the published TLSA.
+	_, keyPEM, err := GenerateSelfSignedForDANE("example")
+	require.NoError(t, err)
+
+	persistedSPKI := spkiHashFromKeyPEM(t, keyPEM)
+
+	// The test server first confirms the domain is DANE (delegation check), then
+	// serves the persisted key on the GET endpoint.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/internal/dns/delegation/example":
+			resp := map[string]string{"domain": "example", "namespace": NamespaceHNS, "status": "active"}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(resp)
+		case r.URL.Path == "/internal/dns/cert" && r.Method == http.MethodPost:
+			// Push endpoint; return success.
+			resp := map[string]any{"ok": true, "tlsa": "3 1 1 " + persistedSPKI, "owner_name": "_443._tcp.example."}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(resp)
+		case r.URL.Path == "/internal/dns/cert/example" && r.Method == http.MethodGet:
+			resp := map[string]any{"ok": true, "domain": "example", "namespace": NamespaceHNS,
+				"private_key_pem": keyPEM, "cert_pem": "ignored", "tlsa": "3 1 1 " + persistedSPKI}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	d := &DANECertGetter{
+		logger:         zap.NewNop(),
+		PortalURL:      server.URL,
+		GatewaySecret:  "test-secret",
+		certs:          make(map[string]*daneCachedCert),
+		statusCache:    make(map[string]*daneStatusEntry),
+		statusCacheTTL: daneStatusCacheTTLDefault,
+		pusher:         newTestDANEManager(t, server.URL),
+		checker:        NewDANEChecker(nil),
+	}
+
+	hello := &tls.ClientHelloInfo{ServerName: "example"}
+	cert, err := d.GetCertificate(context.Background(), hello)
+	require.NoError(t, err)
+	require.NotNil(t, cert)
+
+	// The issued cert's leaf SPKI must match the persisted key's, proving the key
+	// (and thus TLSA) is reused rather than regenerated.
+	require.NotNil(t, cert.Leaf)
+	leafSPKI := dane.ComputeTLSAFromSPKI(cert.Leaf.RawSubjectPublicKeyInfo)
+	assert.Equal(t, persistedSPKI, leafSPKI, "re-issued cert must reuse the persisted key (stable SPKI)")
+}
+
+// spkiHashFromKeyPEM parses a PEM-encoded private key and returns the DANE
+// SPKI SHA-256 hash (TLSA 3 1 1 data) of its public key.
+func spkiHashFromKeyPEM(t *testing.T, keyPEM string) string {
+	t.Helper()
+	block, _ := pem.Decode([]byte(keyPEM))
+	require.NotNil(t, block, "valid key PEM expected")
+
+	var pub any
+	switch block.Type {
+	case "PRIVATE KEY": // PKCS#8
+		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		require.NoError(t, err)
+		signer, ok := key.(crypto.Signer)
+		require.True(t, ok, "expected an ECDSA key")
+		pub = signer.Public()
+	case "EC PRIVATE KEY": // SEC1
+		key, err := x509.ParseECPrivateKey(block.Bytes)
+		require.NoError(t, err)
+		pub = key.Public()
+	default:
+		t.Fatalf("unexpected key PEM type: %s", block.Type)
+	}
+
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	require.NoError(t, err)
+	return dane.ComputeTLSAFromSPKI(spki)
 }
 
 func TestDANECertGetter_GetCertificate_PortalUnreachable(t *testing.T) {

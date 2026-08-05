@@ -12,6 +12,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
+	"go.lumeweb.com/dane"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 )
@@ -201,15 +202,17 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 			return cached.tlsCert, nil
 		}
 
-		certPEM, keyPEM, err := GenerateSelfSignedForDANE(domain)
+		certPEM, keyPEM, reusedKey, err := d.issueCertForKey(domain, namespace)
 		if err != nil {
-			d.logger.Error("failed to generate self-signed cert for DANE domain",
+			d.logger.Error("failed to obtain self-signed cert for DANE domain",
 				zap.String("domain", domain),
 				zap.Error(err))
 			return nil, fmt.Errorf("DANE cert generation failed: %w", err)
 		}
 
-		// Push to portal for TLSA computation (async to avoid blocking handshake)
+		// Push to portal for TLSA computation (async to avoid blocking handshake).
+		// The portal persists the private key once; on re-issue the pushed cert is
+		// derived from that same key so the SPKI (and therefore TLSA) stays stable.
 		go func(dom, ns, cert string) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -224,6 +227,7 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 			if pushErr != nil {
 				d.logger.Warn("failed to push cert to portal for TLSA",
 					zap.String("domain", dom),
+					zap.String("reused_key", reusedKey),
 					zap.Error(pushErr))
 			}
 		}(domain, namespace, certPEM)
@@ -250,6 +254,56 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 		return nil, err
 	}
 	return val.(*tls.Certificate), nil
+}
+
+// issueCertForKey obtains a self-signed cert for a DANE domain, reusing the
+// portal-persisted private key when one exists so the SPKI (and published TLSA)
+// stays stable across renewals. On first bootstrap (no persisted key yet) it
+// generates a fresh key; the portal persists that key during the cert push and
+// every subsequent renewal re-issues around it.
+func (d *DANECertGetter) issueCertForKey(domain, namespace string) (certPEM, keyPEM, reusedKey string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 1. Try to reuse the portal-persisted key. Returns (nil, nil) on first run.
+	stored, gerr := d.pusher.GetCert(ctx, domain, namespace)
+	if gerr != nil {
+		// Portal unreachable or error: still serve a cert rather than fail the
+		// handshake. A fresh key here would churn the SPKI, but that's preferable
+		// to a failed TLS handshake; the next successful renewal will re-persist.
+		d.logger.Warn("failed to fetch persisted DANE key, generating fresh cert",
+			zap.String("domain", domain),
+			zap.Error(gerr))
+		cert, key, ferr := GenerateSelfSignedForDANE(domain)
+		if ferr != nil {
+			return "", "", "false", fmt.Errorf("generate fresh key/cert: %w", ferr)
+		}
+		return cert, key, "false", nil
+	}
+
+	if stored != nil && stored.PrivateKeyPem != "" && stored.CertPem != "" {
+		// Re-issue a fresh self-signed cert around the stable key, preserving the
+		// SPKI so the TLSA record does not change. The persisted cert may be the
+		// prior one; we always re-issue with a refreshed validity window.
+		domains := []string{domain, "*." + domain}
+		notAfter := time.Now().AddDate(1, 0, 0)
+		cert, cerr := dane.IssueCertFromKey(stored.PrivateKeyPem, domains, notAfter)
+		if cerr != nil {
+			return "", "", "true", fmt.Errorf("re-issue cert from persisted key: %w", cerr)
+		}
+		d.logger.Info("reusing persisted DANE key for cert issuance",
+			zap.String("domain", domain),
+			zap.String("namespace", namespace))
+		return cert, stored.PrivateKeyPem, "true", nil
+	}
+
+	// 2. First bootstrap: generate a fresh key+cert. The portal persists this key
+	//    on the subsequent cert push.
+	cert, key, gerr := GenerateSelfSignedForDANE(domain)
+	if gerr != nil {
+		return "", "", "false", fmt.Errorf("generate fresh key/cert: %w", gerr)
+	}
+	return cert, key, "false", nil
 }
 
 // Cleanup closes the portal client.
