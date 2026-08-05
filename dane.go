@@ -2,6 +2,7 @@ package certwebhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -24,6 +25,25 @@ func NewDANECertManager(dns ipfs.DNSService, logger *zap.Logger) *DANECertManage
 		dns:    dns,
 		logger: logger,
 	}
+}
+
+// GetCert fetches the persisted DANE certificate and private key for a domain
+// from the portal. Returns (nil, nil) when the portal has no stored identity
+// yet (first bootstrap). The key is long-lived: Caddy must never log it.
+func (m *DANECertManager) GetCert(ctx context.Context, domain, namespace string) (*ipfs.CertGetResponse, error) {
+	resp, err := m.dns.GetCert(ctx, domain, namespace)
+	if err != nil {
+		if errors.Is(err, ipfs.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get cert failed: %w", err)
+	}
+
+	m.logger.Info("fetched persisted DANE key/cert from portal",
+		zap.String("domain", domain),
+		zap.String("tlsa", resp.Tlsa))
+
+	return resp, nil
 }
 
 // PushCert pushes a certificate to the portal via the SDK's DNS service.

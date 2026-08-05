@@ -11,8 +11,8 @@ require (
 	github.com/caddyserver/certmagic v0.25.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
-	go.lumeweb.com/dane v0.0.1
-	go.lumeweb.com/ipfs-sdk v0.1.57
+	go.lumeweb.com/dane v0.0.2
+	go.lumeweb.com/ipfs-sdk v0.1.69
 	go.opentelemetry.io/otel v1.40.0
 	go.opentelemetry.io/otel/trace v1.40.0
 	go.uber.org/zap v1.27.1

@@ -12,6 +12,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
+	"go.lumeweb.com/dane"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 )
@@ -66,7 +67,11 @@ type DANECertGetter struct {
 
 type daneCachedCert struct {
 	tlsCert *tls.Certificate
-	expiry  time.Time
+	// keyPEM is the portal-persisted private key this cert was issued from.
+	// It is cached alongside the cert so renewals re-issue locally without a
+	// portal round-trip and keep the SPKI (TLSA) stable. Never logged/serialized.
+	keyPEM string
+	expiry time.Time
 }
 
 type daneStatusEntry struct {
@@ -150,18 +155,16 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 		return nil, nil
 	}
 
-	// Check cert cache first
+	// Check cert cache first. Note: we do NOT evict an expired entry here. The
+	// singleflight closure below re-reads the map and captures the reusable key
+	// at closure-execution time, so the singleflight winner always sees whatever
+	// the cache holds (including a concurrent caller's freshly regenerated entry)
+	// and never falls back to an empty key.
 	d.mu.RLock()
 	cached, ok := d.certs[domain]
 	d.mu.RUnlock()
 	if ok && time.Now().Before(cached.expiry) {
 		return cached.tlsCert, nil
-	}
-	if ok {
-		// Evict expired entry
-		d.mu.Lock()
-		delete(d.certs, domain)
-		d.mu.Unlock()
 	}
 
 	// Check DANE status cache before hitting the portal
@@ -193,23 +196,32 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 
 	// Use singleflight to deduplicate concurrent cert generation per domain
 	val, err, _ := d.sf.Do("cert:"+domain, func() (any, error) {
-		// Double-check cert cache after acquiring singleflight
+		// Double-check cache after acquiring singleflight, and capture the reusable
+		// key at closure-execution time so the singleflight winner reads whatever
+		// the cache holds (a concurrent caller may have regenerated it). This avoids
+		// both an empty-key portal round-trip and SPKI/TLSA churn on renewal.
 		d.mu.RLock()
 		cached, ok := d.certs[domain]
 		d.mu.RUnlock()
+		var cachedKeyPEM string
 		if ok && time.Now().Before(cached.expiry) {
 			return cached.tlsCert, nil
 		}
+		if ok {
+			cachedKeyPEM = cached.keyPEM
+		}
 
-		certPEM, keyPEM, err := GenerateSelfSignedForDANE(domain)
+		certPEM, keyPEM, reusedKey, err := d.issueCertForKey(domain, namespace, cachedKeyPEM)
 		if err != nil {
-			d.logger.Error("failed to generate self-signed cert for DANE domain",
+			d.logger.Error("failed to obtain self-signed cert for DANE domain",
 				zap.String("domain", domain),
 				zap.Error(err))
 			return nil, fmt.Errorf("DANE cert generation failed: %w", err)
 		}
 
-		// Push to portal for TLSA computation (async to avoid blocking handshake)
+		// Push to portal for TLSA computation (async to avoid blocking handshake).
+		// The portal persists the private key once; on re-issue the pushed cert is
+		// derived from that same key so the SPKI (and therefore TLSA) stays stable.
 		go func(dom, ns, cert string) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -224,6 +236,7 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 			if pushErr != nil {
 				d.logger.Warn("failed to push cert to portal for TLSA",
 					zap.String("domain", dom),
+					zap.String("reused_key", reusedKey),
 					zap.Error(pushErr))
 			}
 		}(domain, namespace, certPEM)
@@ -236,12 +249,14 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 		d.mu.Lock()
 		d.certs[domain] = &daneCachedCert{
 			tlsCert: &tlsCert,
+			keyPEM:  keyPEM,
 			expiry:  time.Now().Add(daneCertTTL),
 		}
 		d.mu.Unlock()
 
 		d.logger.Info("self-signed cert generated for DANE domain",
-			zap.String("domain", domain))
+			zap.String("domain", domain),
+			zap.String("reused_key", reusedKey))
 
 		return &tlsCert, nil
 	})
@@ -250,6 +265,64 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 		return nil, err
 	}
 	return val.(*tls.Certificate), nil
+}
+
+// issueCertForKey obtains a self-signed cert for a DANE domain, reusing the
+// stable private key so the SPKI (and published TLSA) stays constant across
+// renewals.
+//
+//   - cachedKeyPEM, when non-empty, is the key already held in memory from a
+//     prior fetch; the cert is re-issued from it locally with no network call.
+//   - Otherwise the portal-persisted key is fetched once (per process, per
+//     domain). Only the very first bootstrap has no key at all, in which case a
+//     fresh key is generated and the portal persists it on the next cert push.
+//   - Any failure (network, corrupt/mismatched key) falls back to a freshly
+//     generated key rather than aborting the TLS handshake.
+func (d *DANECertGetter) issueCertForKey(domain, namespace, cachedKeyPEM string) (certPEM, keyPEM, reusedKey string, err error) {
+	keyPEM = cachedKeyPEM
+
+	if keyPEM == "" {
+		// No key in memory yet: consult the portal once. Bounded so a slow or
+		// unreachable portal cannot stall the handshake indefinitely.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		stored, gerr := d.pusher.GetCert(ctx, domain, namespace)
+		if gerr == nil && stored != nil && stored.PrivateKeyPem != "" {
+			keyPEM = stored.PrivateKeyPem
+		} else if gerr != nil {
+			// Portal unreachable/error: still serve a cert rather than fail the
+			// handshake. A fresh key churns the SPKI, but that's preferable to a
+			// failed TLS handshake; the next successful fetch re-persists.
+			d.logger.Warn("failed to fetch persisted DANE key, generating fresh cert",
+				zap.String("domain", domain),
+				zap.Error(gerr))
+		}
+	}
+
+	if keyPEM != "" {
+		// Re-issue a fresh self-signed cert around the stable key, preserving the
+		// SPKI so the TLSA record does not change.
+		domains := []string{domain, "*." + domain}
+		notAfter := time.Now().AddDate(1, 0, 0)
+		cert, cerr := dane.IssueCertFromKey(keyPEM, domains, notAfter)
+		if cerr == nil {
+			return cert, keyPEM, "true", nil
+		}
+		// Corrupt/mismatched persisted key: fall back to a fresh key instead of
+		// aborting the handshake.
+		d.logger.Warn("failed to re-issue cert from persisted key, generating fresh",
+			zap.String("domain", domain),
+			zap.Error(cerr))
+	}
+
+	// Bootstrap or fallback: generate a fresh key+cert. The portal persists this
+	// key on the subsequent cert push.
+	freshCert, freshKey, ferr := GenerateSelfSignedForDANE(domain)
+	if ferr != nil {
+		return "", "", "false", fmt.Errorf("generate fresh key/cert: %w", ferr)
+	}
+	return freshCert, freshKey, "false", nil
 }
 
 // Cleanup closes the portal client.
