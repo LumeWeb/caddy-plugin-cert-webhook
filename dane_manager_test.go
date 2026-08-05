@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -209,7 +210,7 @@ func TestDANECertGetter_GetCertificate_ReusesPersistedKey(t *testing.T) {
 	d := &DANECertGetter{
 		logger:         zap.NewNop(),
 		PortalURL:      server.URL,
-		GatewaySecret:  "test-secret",
+		GatewaySecret:  fmt.Sprintf("test-secret-%d", time.Now().UnixNano()),
 		certs:          make(map[string]*daneCachedCert),
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
@@ -227,6 +228,48 @@ func TestDANECertGetter_GetCertificate_ReusesPersistedKey(t *testing.T) {
 	require.NotNil(t, cert.Leaf)
 	leafSPKI := dane.ComputeTLSAFromSPKI(cert.Leaf.RawSubjectPublicKeyInfo)
 	assert.Equal(t, persistedSPKI, leafSPKI, "re-issued cert must reuse the persisted key (stable SPKI)")
+}
+
+func TestDANECertGetter_GetCertificate_CorruptPersistedKeyFallsBack(t *testing.T) {
+	// Portal returns a corrupt/mismatched persisted key (invalid PEM). The cert
+	// getter must NOT abort the handshake; it falls back to a fresh key and
+	// still returns a usable cert.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/internal/dns/delegation/example":
+			resp := map[string]string{"domain": "example", "namespace": NamespaceHNS, "status": "active"}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(resp)
+		case r.URL.Path == "/internal/dns/cert/example" && r.Method == http.MethodGet:
+			// Corrupt key material.
+			resp := map[string]any{"ok": true, "domain": "example", "namespace": NamespaceHNS,
+				"private_key_pem": "-----BEGIN PRIVATE KEY-----\nbm90LWEta2V5\n-----END PRIVATE KEY-----", "cert_pem": "x", "tlsa": "3 1 1 deadbeef"}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	d := &DANECertGetter{
+		logger:         zap.NewNop(),
+		PortalURL:      server.URL,
+		GatewaySecret:  fmt.Sprintf("test-secret-%d", time.Now().UnixNano()),
+		certs:          make(map[string]*daneCachedCert),
+		statusCache:    make(map[string]*daneStatusEntry),
+		statusCacheTTL: daneStatusCacheTTLDefault,
+		pusher:         newTestDANEManager(t, server.URL),
+		checker:        NewDANEChecker(nil),
+	}
+
+	hello := &tls.ClientHelloInfo{ServerName: "example"}
+	cert, err := d.GetCertificate(context.Background(), hello)
+	require.NoError(t, err)
+	require.NotNil(t, cert, "must fall back to a fresh cert instead of failing the handshake")
+	require.NotNil(t, cert.Leaf)
+	assert.Contains(t, cert.Leaf.DNSNames, "example")
 }
 
 // spkiHashFromKeyPEM parses a PEM-encoded private key and returns the DANE
