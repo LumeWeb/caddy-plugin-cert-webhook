@@ -210,7 +210,7 @@ func TestDANECertGetter_GetCertificate_ReusesPersistedKey(t *testing.T) {
 	d := &DANECertGetter{
 		logger:         zap.NewNop(),
 		PortalURL:      server.URL,
-		GatewaySecret:  fmt.Sprintf("test-secret-%d", time.Now().UnixNano()),
+		GatewaySecret:  fmt.Sprintf("gw-%d", time.Now().UnixNano()),
 		certs:          make(map[string]*daneCachedCert),
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
@@ -256,7 +256,7 @@ func TestDANECertGetter_GetCertificate_CorruptPersistedKeyFallsBack(t *testing.T
 	d := &DANECertGetter{
 		logger:         zap.NewNop(),
 		PortalURL:      server.URL,
-		GatewaySecret:  fmt.Sprintf("test-secret-%d", time.Now().UnixNano()),
+		GatewaySecret:  fmt.Sprintf("gw-%d", time.Now().UnixNano()),
 		certs:          make(map[string]*daneCachedCert),
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,

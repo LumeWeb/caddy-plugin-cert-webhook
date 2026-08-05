@@ -159,11 +159,17 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 	d.mu.RLock()
 	cached, ok := d.certs[domain]
 	d.mu.RUnlock()
+
+	// Carried across the renewal so the key can be reused locally (no portal
+	// round-trip) once the singleflight regenerates the cert.
+	var cachedKeyPEM string
 	if ok && time.Now().Before(cached.expiry) {
 		return cached.tlsCert, nil
 	}
 	if ok {
-		// Evict expired entry
+		// Preserve the key before evicting the expired entry; the renewal below
+		// re-issues from it to keep the SPKI (TLSA) stable.
+		cachedKeyPEM = cached.keyPEM
 		d.mu.Lock()
 		delete(d.certs, domain)
 		d.mu.Unlock()
@@ -198,20 +204,15 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 
 	// Use singleflight to deduplicate concurrent cert generation per domain
 	val, err, _ := d.sf.Do("cert:"+domain, func() (any, error) {
-		// Double-check cert cache after acquiring singleflight. Carry the cached
-		// key across renewal so the re-issue happens locally (no portal round-trip)
-		// and the SPKI stays stable.
-		var cachedKeyPEM string
+		// Double-check cert cache after acquiring singleflight (another caller may
+		// have populated it). The key survives eviction via the outer cachedKeyPEM,
+		// so the re-issue happens locally with no portal round-trip.
 		d.mu.RLock()
 		cached, ok := d.certs[domain]
+		d.mu.RUnlock()
 		if ok && time.Now().Before(cached.expiry) {
-			d.mu.RUnlock()
 			return cached.tlsCert, nil
 		}
-		if ok {
-			cachedKeyPEM = cached.keyPEM
-		}
-		d.mu.RUnlock()
 
 		certPEM, keyPEM, reusedKey, err := d.issueCertForKey(domain, namespace, cachedKeyPEM)
 		if err != nil {
