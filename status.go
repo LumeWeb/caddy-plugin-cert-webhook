@@ -53,9 +53,9 @@ var (
 )
 
 // markDANECertServed records that a DANE self-signed cert was served for domain,
-// valid until expiresAt. Called by the getter after a successful handshake cert.
-// Runs off the handshake hot path (cert issue is rare), so it also prunes any
-// expired entries to bound map growth.
+// valid until expiresAt. Called by the getter after generating a cert (rare, off
+// the handshake hot path), so it also prunes any expired entries to bound map
+// growth.
 func markDANECertServed(domain string, expiresAt time.Time) {
 	daneReadyMu.Lock()
 	defer daneReadyMu.Unlock()
@@ -64,6 +64,16 @@ func markDANECertServed(domain string, expiresAt time.Time) {
 			delete(daneReadyCerts, d)
 		}
 	}
+	daneReadyCerts[domain] = &daneReadyCert{expiresAt: expiresAt}
+}
+
+// touchDANECertServed records that a cached DANE cert is being served, updating
+// only this domain's entry. This runs on the handshake hot path (every cached
+// cert), so it avoids scanning the whole map for expired entries — that prune
+// is restricted to the rare generation path via markDANECertServed.
+func touchDANECertServed(domain string, expiresAt time.Time) {
+	daneReadyMu.Lock()
+	defer daneReadyMu.Unlock()
 	daneReadyCerts[domain] = &daneReadyCert{expiresAt: expiresAt}
 }
 

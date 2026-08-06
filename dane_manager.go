@@ -200,9 +200,10 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 	d.mu.RUnlock()
 	if ok && time.Now().Before(cached.expiry) {
 		// Re-establish readiness: a transient non-DANE classification may have
-		// cleared the ready record (see the !isDANE branch above), so mirror the
-		// marking done on fresh issuance to keep status accurate.
-		markDANECertServed(domain, cached.expiry)
+		// cleared the ready record (see the !isDANE branch above). This is the
+		// handshake hot path, so touch only this domain's entry — the full-map
+		// expired-entry prune stays on the rare cert-generation path.
+		touchDANECertServed(domain, cached.expiry)
 		return cached.tlsCert, nil
 	}
 
