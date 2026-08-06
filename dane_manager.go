@@ -3,6 +3,9 @@ package certwebhook
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -67,11 +70,7 @@ type DANECertGetter struct {
 
 type daneCachedCert struct {
 	tlsCert *tls.Certificate
-	// keyPEM is the portal-persisted private key this cert was issued from.
-	// It is cached alongside the cert so renewals re-issue locally without a
-	// portal round-trip and keep the SPKI (TLSA) stable. Never logged/serialized.
-	keyPEM string
-	expiry time.Time
+	expiry  time.Time
 }
 
 type daneStatusEntry struct {
@@ -155,19 +154,9 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 		return nil, nil
 	}
 
-	// Check cert cache first. Note: we do NOT evict an expired entry here. The
-	// singleflight closure below re-reads the map and captures the reusable key
-	// at closure-execution time, so the singleflight winner always sees whatever
-	// the cache holds (including a concurrent caller's freshly regenerated entry)
-	// and never falls back to an empty key.
-	d.mu.RLock()
-	cached, ok := d.certs[domain]
-	d.mu.RUnlock()
-	if ok && time.Now().Before(cached.expiry) {
-		return cached.tlsCert, nil
-	}
-
-	// Check DANE status cache before hitting the portal
+	// Resolve DANE classification BEFORE consulting the cert cache so a domain
+	// reclassified to non-DANE stops being served a stale self-signed cert and
+	// stops reporting ready immediately.
 	isDANE, namespace, daneCached := d.cachedDANEStatus(domain)
 	if !daneCached {
 		// Use singleflight to deduplicate concurrent DANE status lookups
@@ -191,7 +180,30 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 	}
 
 	if !isDANE {
+		// This handshake is not served by the DANE getter. Clear the ready record
+		// so we don't report ready, and fall through to normal issuance. We keep
+		// any cached self-signed cert in place (never served here) so a transient
+		// flapping classification back to DANE can reuse it instead of forcing a
+		// re-issue / SPKI churn.
+		clearDANECert(domain)
 		return nil, nil
+	}
+
+	// Confirmed DANE: serve from the in-memory cert cache if still valid. Note we
+	// do NOT evict an expired entry here; the singleflight closure below re-reads
+	// the map and captures the reusable key at closure-execution time, so the
+	// singleflight winner always sees whatever the cache holds (including a
+	// concurrent caller's freshly regenerated entry) and never falls back to an
+	// empty key.
+	d.mu.RLock()
+	cached, ok := d.certs[domain]
+	d.mu.RUnlock()
+	if ok && time.Now().Before(cached.expiry) {
+		// Re-establish readiness: a transient non-DANE classification may have
+		// cleared the ready record (see the !isDANE branch above), so mirror the
+		// marking done on fresh issuance to keep status accurate.
+		markDANECertServed(domain, cached.expiry)
+		return cached.tlsCert, nil
 	}
 
 	// Use singleflight to deduplicate concurrent cert generation per domain
@@ -208,7 +220,18 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 			return cached.tlsCert, nil
 		}
 		if ok {
-			cachedKeyPEM = cached.keyPEM
+			// The served cert is the single source of truth for the stable key: its
+			// embedded PrivateKey is the portal-persisted key this cert was derived
+			// from. Re-extract it (instead of a separate keyPEM field) so renewals
+			// re-issue locally and keep the SPKI (TLSA) stable.
+			kp, kerr := pemFromCertKey(cached.tlsCert)
+			if kerr != nil {
+				d.logger.Warn("failed to extract DANE key from cached cert, re-fetching",
+					zap.String("domain", domain),
+					zap.Error(kerr))
+			} else {
+				cachedKeyPEM = kp
+			}
 		}
 
 		certPEM, keyPEM, reusedKey, err := d.issueCertForKey(domain, namespace, cachedKeyPEM)
@@ -246,13 +269,27 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 			return nil, fmt.Errorf("parse generated cert: %w", err)
 		}
 
-		d.mu.Lock()
-		d.certs[domain] = &daneCachedCert{
-			tlsCert: &tlsCert,
-			keyPEM:  keyPEM,
-			expiry:  time.Now().Add(daneCertTTL),
+		// Re-check classification before caching: an in-flight generation may have
+		// finished after the domain was reclassified to non-DANE. In that case serve
+		// the cert for this handshake but do not cache it or mark it ready, so a
+		// now-non-DANE domain cannot be handed a stale DANE cert / ready flag later.
+		isDANENow, _, cachedNow := d.cachedDANEStatus(domain)
+		if !cachedNow {
+			n, _, cerr := d.checker.IsDANEDomain(ctx, domain)
+			if cerr == nil {
+				isDANENow = n
+				d.cacheDANEStatus(domain, n, namespace)
+			}
 		}
-		d.mu.Unlock()
+		if isDANENow {
+			d.mu.Lock()
+			d.certs[domain] = &daneCachedCert{
+				tlsCert: &tlsCert,
+				expiry:  time.Now().Add(daneCertTTL),
+			}
+			d.mu.Unlock()
+			markDANECertServed(domain, time.Now().Add(daneCertTTL))
+		}
 
 		d.logger.Info("self-signed cert generated for DANE domain",
 			zap.String("domain", domain),
@@ -265,6 +302,22 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 		return nil, err
 	}
 	return val.(*tls.Certificate), nil
+}
+
+// pemFromCertKey re-encodes the private key embedded in a served
+// tls.Certificate as PKCS#8 PEM. This is the single source of truth for the
+// stable DANE key: the same key that was used to mint the cert, so a renewal
+// re-issued from it preserves the SPKI (and published TLSA). Returns an error
+// if the cert carries no usable private key.
+func pemFromCertKey(tlsCert *tls.Certificate) (string, error) {
+	if tlsCert == nil || tlsCert.PrivateKey == nil {
+		return "", errors.New("cert has no private key")
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(tlsCert.PrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("marshal private key: %w", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})), nil
 }
 
 // issueCertForKey obtains a self-signed cert for a DANE domain, reusing the
