@@ -332,7 +332,6 @@ func TestDANECertGetter_GetCertificate_ConcurrentExpiryReusesKey(t *testing.T) {
 	d.cacheDANEStatus("example", true, NamespaceHNS)
 	d.certs["example"] = &daneCachedCert{
 		tlsCert: &tlsSeed,
-		keyPEM:  seedKey,
 		expiry:  time.Now().Add(-time.Minute), // already expired
 	}
 
