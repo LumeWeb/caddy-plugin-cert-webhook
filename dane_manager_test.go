@@ -22,6 +22,28 @@ import (
 	"go.uber.org/zap"
 )
 
+// TestDANECertGetter_ApplyEnvDefaults verifies the getter falls back to the
+// same PORTAL_URL / GATEWAY_SECRET environment variables the webhook app uses,
+// so no duplicate config is needed when registering get_certificate dane.
+func TestDANECertGetter_ApplyEnvDefaults(t *testing.T) {
+	t.Setenv(EnvPortalURL, "https://portal.example.com")
+	t.Setenv(EnvGatewaySecret, "sekret")
+
+	t.Run("fills empty fields from env", func(t *testing.T) {
+		g := &DANECertGetter{}
+		g.applyEnvDefaults()
+		assert.Equal(t, "https://portal.example.com", g.PortalURL)
+		assert.Equal(t, "sekret", g.GatewaySecret)
+	})
+
+	t.Run("keeps explicitly configured fields", func(t *testing.T) {
+		g := &DANECertGetter{PortalURL: "https://explicit.example.com", GatewaySecret: "explicit"}
+		g.applyEnvDefaults()
+		assert.Equal(t, "https://explicit.example.com", g.PortalURL)
+		assert.Equal(t, "explicit", g.GatewaySecret)
+	})
+}
+
 // newTestDANEManager creates a DANECertManager backed by a PortalClient
 // pointing at the given test server URL.
 func newTestDANEManager(t *testing.T, serverURL string) *DANECertManager {

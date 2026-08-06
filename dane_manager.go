@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -95,6 +96,10 @@ func (*DANECertGetter) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up the module.
 func (d *DANECertGetter) Provision(ctx caddy.Context) error {
+	// Fall back to the same environment defaults the webhook app uses, so the
+	// getter reuses the compose-level PORTAL_URL / GATEWAY_SECRET instead of
+	// requiring duplicate per-directive config.
+	d.applyEnvDefaults()
 	if err := validatePortalURL(d.PortalURL); err != nil {
 		return err
 	}
@@ -115,6 +120,18 @@ func (d *DANECertGetter) Provision(ctx caddy.Context) error {
 		zap.String("portal_url", d.PortalURL))
 
 	return nil
+}
+
+// applyEnvDefaults fills any unset config fields from the same environment
+// variables the webhook app uses, so the getter reuses compose-level secrets
+// instead of duplicating them in the Caddyfile.
+func (d *DANECertGetter) applyEnvDefaults() {
+	if d.PortalURL == "" {
+		d.PortalURL = os.Getenv(EnvPortalURL)
+	}
+	if d.GatewaySecret == "" {
+		d.GatewaySecret = os.Getenv(EnvGatewaySecret)
+	}
 }
 
 // cachedDANEStatus returns cached DANE status if still valid.
