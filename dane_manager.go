@@ -64,8 +64,8 @@ type DANECertGetter struct {
 
 	// daneStatusCache caches IsDANEDomain results to avoid blocking
 	// every handshake on a portal round-trip
-	statusMu      sync.RWMutex
-	statusCache   map[string]*daneStatusEntry
+	statusMu       sync.RWMutex
+	statusCache    map[string]*daneStatusEntry
 	statusCacheTTL time.Duration
 }
 
@@ -75,7 +75,7 @@ type daneCachedCert struct {
 }
 
 type daneStatusEntry struct {
-	isDANE   bool
+	isDANE    bool
 	namespace string
 	expiresAt time.Time
 }
@@ -263,7 +263,7 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 		// Push to portal for TLSA computation (async to avoid blocking handshake).
 		// The portal persists the private key once; on re-issue the pushed cert is
 		// derived from that same key so the SPKI (and therefore TLSA) stays stable.
-		go func(dom, ns, cert string) {
+		go func(dom, ns, cert, key string) {
 			defer func() {
 				if r := recover(); r != nil {
 					d.logger.Error("DANE cert push panicked",
@@ -273,14 +273,14 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 			}()
 			pushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			_, pushErr := d.pusher.PushCert(pushCtx, dom, ns, cert)
+			_, pushErr := d.pusher.PushCert(pushCtx, dom, ns, cert, key)
 			if pushErr != nil {
 				d.logger.Warn("failed to push cert to portal for TLSA",
 					zap.String("domain", dom),
 					zap.String("reused_key", reusedKey),
 					zap.Error(pushErr))
 			}
-		}(domain, namespace, certPEM)
+		}(domain, namespace, certPEM, keyPEM)
 
 		tlsCert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 		if err != nil {
