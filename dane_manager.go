@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -63,8 +64,8 @@ type DANECertGetter struct {
 
 	// daneStatusCache caches IsDANEDomain results to avoid blocking
 	// every handshake on a portal round-trip
-	statusMu      sync.RWMutex
-	statusCache   map[string]*daneStatusEntry
+	statusMu       sync.RWMutex
+	statusCache    map[string]*daneStatusEntry
 	statusCacheTTL time.Duration
 }
 
@@ -74,7 +75,7 @@ type daneCachedCert struct {
 }
 
 type daneStatusEntry struct {
-	isDANE   bool
+	isDANE    bool
 	namespace string
 	expiresAt time.Time
 }
@@ -95,6 +96,10 @@ func (*DANECertGetter) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up the module.
 func (d *DANECertGetter) Provision(ctx caddy.Context) error {
+	// Fall back to the same environment defaults the webhook app uses, so the
+	// getter reuses the compose-level PORTAL_URL / GATEWAY_SECRET instead of
+	// requiring duplicate per-directive config.
+	d.applyEnvDefaults()
 	if err := validatePortalURL(d.PortalURL); err != nil {
 		return err
 	}
@@ -115,6 +120,18 @@ func (d *DANECertGetter) Provision(ctx caddy.Context) error {
 		zap.String("portal_url", d.PortalURL))
 
 	return nil
+}
+
+// applyEnvDefaults fills any unset config fields from the same environment
+// variables the webhook app uses, so the getter reuses compose-level secrets
+// instead of duplicating them in the Caddyfile.
+func (d *DANECertGetter) applyEnvDefaults() {
+	if d.PortalURL == "" {
+		d.PortalURL = os.Getenv(EnvPortalURL)
+	}
+	if d.GatewaySecret == "" {
+		d.GatewaySecret = os.Getenv(EnvGatewaySecret)
+	}
 }
 
 // cachedDANEStatus returns cached DANE status if still valid.
@@ -246,7 +263,7 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 		// Push to portal for TLSA computation (async to avoid blocking handshake).
 		// The portal persists the private key once; on re-issue the pushed cert is
 		// derived from that same key so the SPKI (and therefore TLSA) stays stable.
-		go func(dom, ns, cert string) {
+		go func(dom, ns, cert, key string) {
 			defer func() {
 				if r := recover(); r != nil {
 					d.logger.Error("DANE cert push panicked",
@@ -256,14 +273,14 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 			}()
 			pushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			_, pushErr := d.pusher.PushCert(pushCtx, dom, ns, cert)
+			_, pushErr := d.pusher.PushCert(pushCtx, dom, ns, cert, key)
 			if pushErr != nil {
 				d.logger.Warn("failed to push cert to portal for TLSA",
 					zap.String("domain", dom),
 					zap.String("reused_key", reusedKey),
 					zap.Error(pushErr))
 			}
-		}(domain, namespace, certPEM)
+		}(domain, namespace, certPEM, keyPEM)
 
 		tlsCert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 		if err != nil {

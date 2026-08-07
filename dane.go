@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	ipfs "go.lumeweb.com/ipfs-sdk"
 	"go.lumeweb.com/dane"
+	ipfs "go.lumeweb.com/ipfs-sdk"
 	"go.uber.org/zap"
 )
 
@@ -46,13 +46,17 @@ func (m *DANECertManager) GetCert(ctx context.Context, domain, namespace string)
 	return resp, nil
 }
 
-// PushCert pushes a certificate to the portal via the SDK's DNS service.
-// The portal computes TLSA and returns it.
-func (m *DANECertManager) PushCert(ctx context.Context, domain, namespace, certPEM string) (*ipfs.CertPushResponse, error) {
+// PushCert pushes a certificate and its private key to the portal via the SDK's
+// DNS service. The portal computes TLSA from the cert and persists the private
+// key (once) so it can re-issue around a stable SPKI and serve the DANE
+// republish endpoint. Passing the key is required: without it the portal has no
+// key material and `dane republish` correctly reports "no stored certificate".
+func (m *DANECertManager) PushCert(ctx context.Context, domain, namespace, certPEM, privateKeyPEM string) (*ipfs.CertPushResponse, error) {
 	resp, err := m.dns.PushCert(ctx, ipfs.CertPushRequest{
-		Domain:    domain,
-		Namespace: namespace,
-		CertPem:   certPEM,
+		Domain:        domain,
+		Namespace:     namespace,
+		CertPem:       certPEM,
+		PrivateKeyPem: privateKeyPEM,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cert push failed: %w", err)

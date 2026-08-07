@@ -35,7 +35,10 @@ func TestDANECertManager_ComputeTLSA(t *testing.T) {
 }
 
 func TestDANECertManager_PushCert_Success(t *testing.T) {
-	certPEM := "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKHBfpE\n-----END CERTIFICATE-----"
+	// Generate a real cert+key pair rather than hard-coding key material, which
+	// must never appear in source.
+	certPEM, keyPEM, err := GenerateSelfSignedForDANE("example")
+	require.NoError(t, err)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/internal/dns/cert", r.URL.Path)
@@ -48,6 +51,10 @@ func TestDANECertManager_PushCert_Success(t *testing.T) {
 		assert.Equal(t, "example", req["domain"])
 		assert.Equal(t, NamespaceHNS, req["namespace"])
 		assert.Equal(t, certPEM, req["cert_pem"])
+		// Regression: the private key must be sent so the portal can persist it
+		// and serve the DANE republish endpoint. Missing key = 409 on republish.
+		assert.NotEmpty(t, req["private_key_pem"])
+		assert.Equal(t, keyPEM, req["private_key_pem"])
 
 		resp := map[string]any{"ok": true, "tlsa": "3 1 1 abc123", "owner_name": "_443._tcp.example."}
 		w.Header().Set("Content-Type", "application/json")
@@ -59,13 +66,36 @@ func TestDANECertManager_PushCert_Success(t *testing.T) {
 	portal, err := NewPortalClient(server.URL, "test-secret")
 	require.NoError(t, err)
 	m := NewDANECertManager(portal.DNS(), zap.NewNop())
-	result, err := m.PushCert(context.Background(), "example", NamespaceHNS, certPEM)
+	result, err := m.PushCert(context.Background(), "example", NamespaceHNS, certPEM, keyPEM)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, result)
 	assert.True(t, result.Ok)
 	assert.Equal(t, "3 1 1 abc123", result.Tlsa)
 	assert.Equal(t, "_443._tcp.example.", result.OwnerName)
+}
+
+func TestDANECertManager_PushCert_KeyOptional(t *testing.T) {
+	// A push with an empty key must still be accepted (plain TLSA update path).
+	// Generate a real cert rather than hard-coding certificate material.
+	certPEM, _, err := GenerateSelfSignedForDANE("example")
+	require.NoError(t, err)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		assert.Equal(t, "", req["private_key_pem"])
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "tlsa": "3 1 1 abc123", "owner_name": "_443._tcp.example."})
+	}))
+	defer server.Close()
+
+	portal, err := NewPortalClient(server.URL, "test-secret")
+	require.NoError(t, err)
+	m := NewDANECertManager(portal.DNS(), zap.NewNop())
+	_, err = m.PushCert(context.Background(), "example", NamespaceHNS, certPEM, "")
+	require.NoError(t, err)
 }
 
 func TestDANECertManager_PushCert_StatusError(t *testing.T) {
@@ -78,7 +108,7 @@ func TestDANECertManager_PushCert_StatusError(t *testing.T) {
 	portal, err := NewPortalClient(server.URL, "secret")
 	require.NoError(t, err)
 	m := NewDANECertManager(portal.DNS(), zap.NewNop())
-	_, err = m.PushCert(context.Background(), "example", NamespaceHNS, "cert-pem")
+	_, err = m.PushCert(context.Background(), "example", NamespaceHNS, "cert-pem", "")
 
 	assert.Error(t, err)
 }
@@ -87,7 +117,7 @@ func TestDANECertManager_PushCert_ServerUnreachable(t *testing.T) {
 	portal, err := NewPortalClient("http://127.0.0.1:1", "secret")
 	require.NoError(t, err)
 	m := NewDANECertManager(portal.DNS(), zap.NewNop())
-	_, err = m.PushCert(context.Background(), "example", NamespaceHNS, "cert-pem")
+	_, err = m.PushCert(context.Background(), "example", NamespaceHNS, "cert-pem", "")
 
 	assert.Error(t, err)
 }
