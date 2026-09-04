@@ -12,10 +12,11 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
 	go.lumeweb.com/dane v0.0.2
+	go.lumeweb.com/icann-tlds v0.1.0
 	go.lumeweb.com/ipfs-sdk v0.1.70
 	go.opentelemetry.io/otel v1.40.0
 	go.opentelemetry.io/otel/trace v1.40.0
-	go.uber.org/zap v1.27.1
+	go.uber.org/zap v1.28.0
 	golang.org/x/sync v0.22.0
 )
 
@@ -41,6 +42,7 @@ require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/aryann/difflib v0.0.0-20210328193216-ff5ff6dc229b // indirect
 	github.com/avast/retry-go/v4 v4.7.0 // indirect
+	github.com/avast/retry-go/v5 v5.0.0 // indirect
 	github.com/bdragon300/tusgo v0.1.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/caddyserver/zerossl v0.1.5 // indirect

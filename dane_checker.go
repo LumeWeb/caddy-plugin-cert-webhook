@@ -2,9 +2,14 @@ package certwebhook
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
+	"time"
 
+	icann "go.lumeweb.com/icann-tlds"
 	ipfs "go.lumeweb.com/ipfs-sdk"
+	"go.uber.org/zap"
 )
 
 // Namespace constants for DANE domain classification.
@@ -18,12 +23,11 @@ const (
 	NamespaceHNS = "hns"
 )
 
-// IsDaneDomain checks whether a domain is a DANE-enabled alt-root domain.
-// A domain is DANE-enabled if it is a single-label domain (no dot),
-// meaning it cannot be resolved via standard ICANN DNS and requires
-// an alt-root delegation with DANE TLSA authentication.
-func IsDaneDomain(domain string) bool {
-	return domain != "" && !strings.Contains(domain, ".")
+// NormalizeDomain normalizes a certificate name for classification: trims
+// surrounding space and the optional trailing root dot, lower-cases it, and
+// reports whether anything is left.
+func NormalizeDomain(domain string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
 }
 
 // WebsiteLookup provides portal website lookups for DANE classification.
@@ -31,39 +35,116 @@ type WebsiteLookup interface {
 	GetGatewayWebsite(ctx context.Context, domain string) (*ipfs.GatewayWebsiteResponse, error)
 }
 
+// DaneChecker is the classification surface DANECertGetter depends on.
+type DaneChecker interface {
+	// IsDANEDomain reports whether a domain requires DANE TLSA support
+	// and which namespace it belongs to.
+	IsDANEDomain(ctx context.Context, domain string) (bool, string, error)
+}
+
 // DANEChecker determines whether a domain needs DANE TLSA support.
-// If a WebsiteLookup is available it uses the portal's namespace field;
-// otherwise it falls back to the single-label heuristic.
+//
+// The portal's namespace response is the sole classification authority: no
+// structural property of the name (label count, suffix shape) ever marks a
+// domain as DANE. The ICANN root-zone registry is used only as a fast path
+// to skip the portal for domains whose final label is a registered ICANN
+// TLD — such a name can never be alt-root.
 type DANEChecker struct {
-	lookup WebsiteLookup
+	lookup   WebsiteLookup
+	registry icann.Registry
+}
+
+// checkerRegistryRefreshInterval controls how often the process-wide
+// registry re-fetches the IANA root-zone list so newly delegated TLDs are
+// adopted without a restart.
+const checkerRegistryRefreshInterval = 24 * time.Hour
+
+var (
+	checkerRegistryOnce sync.Once
+	checkerRegistry     icann.Registry
+)
+
+// sharedCheckerRegistry returns the process-wide ICANN registry, starting
+// its lazy fetch and background refresh on first use. Sharing one instance
+// across checkers keeps portal availability decoupled from real ICANN
+// issuance even as Caddy configurations reload.
+func sharedCheckerRegistry() icann.Registry {
+	checkerRegistryOnce.Do(func() {
+		reg, err := icann.New(icann.WithLogger(zap.NewNop()))
+		if err != nil {
+			// icann.New only fails on invalid options; defaults are
+			// valid, so this is unreachable but keeps the checker usable.
+			reg, _ = icann.New()
+		}
+		checkerRegistry = reg
+		go refreshCheckerRegistry(context.Background(), reg, checkerRegistryRefreshInterval)
+	})
+	return checkerRegistry
+}
+
+// refreshCheckerRegistry periodically re-fetches the root-zone list until
+// ctx is cancelled. Fetch diagnostics (including failures) are logged by
+// the registry itself; a failed refresh keeps the previously loaded list.
+func refreshCheckerRegistry(ctx context.Context, reg icann.Registry, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = reg.Refresh(rctx)
+			cancel()
+		}
+	}
 }
 
 // NewDANEChecker creates a DANE domain checker with the given portal lookup.
+// The ICANN root-zone registry is process-wide, fetched lazily on first
+// classification, and refreshed periodically in the background.
 func NewDANEChecker(lookup WebsiteLookup) *DANEChecker {
-	return &DANEChecker{lookup: lookup}
+	return &DANEChecker{lookup: lookup, registry: sharedCheckerRegistry()}
 }
 
 // IsDANEDomain checks whether a domain is DANE-enabled.
-// Multi-label ICANN domains (containing a dot) are never DANE, so the
-// portal lookup is skipped entirely for them. For single-label domains
-// the portal's namespace field is consulted; if that fails, the
-// single-label heuristic is used as fallback.
+//
+// A domain whose final label is a registered ICANN TLD is classified ICANN
+// immediately; the portal is never consulted for it. For every other
+// domain — dotted alt-root names like pinner.hns and single labels alike —
+// the portal must answer with a namespace. When the portal is unreachable
+// or the registry cannot load, classification fails with an error instead
+// of guessing, so callers can fail the handshake rather than either serve
+// DANE blindly or fall through to public ACME.
 func (d *DANEChecker) IsDANEDomain(ctx context.Context, domain string) (bool, string, error) {
-	if !IsDaneDomain(domain) {
+	domain = NormalizeDomain(domain)
+	if domain == "" {
+		return false, NamespaceICANN, nil
+	}
+
+	isICANN, regErr := d.registry.IsICANN(ctx, domain)
+	if regErr == nil && isICANN {
 		return false, NamespaceICANN, nil
 	}
 
 	if d.lookup != nil {
-		resp, err := d.lookup.GetGatewayWebsite(ctx, domain)
-		if err == nil && resp != nil && resp.Namespace != nil {
-			ns := string(*resp.Namespace)
-			if ns == NamespaceHNS {
-				return true, NamespaceHNS, nil
-			}
-			return false, NamespaceICANN, nil
+		resp, lookupErr := d.lookup.GetGatewayWebsite(ctx, domain)
+		if lookupErr != nil {
+			return false, NamespaceICANN, fmt.Errorf("classify %s: portal lookup failed: %w", domain, lookupErr)
 		}
-		// Portal lookup failed or namespace not set — fall back to heuristic
+		if resp == nil {
+			return false, NamespaceICANN, fmt.Errorf("classify %s: portal returned no website data", domain)
+		}
+		if resp.Namespace != nil && string(*resp.Namespace) == NamespaceHNS {
+			return true, NamespaceHNS, nil
+		}
+		return false, NamespaceICANN, nil
 	}
 
-	return true, NamespaceHNS, nil
+	if regErr != nil {
+		return false, NamespaceICANN, fmt.Errorf(
+			"classify %s: portal lookup unavailable and icann registry failed to load: %w", domain, regErr)
+	}
+	return false, NamespaceICANN, fmt.Errorf(
+		"classify %s: portal lookup unavailable and %s is not a registered icann tld", domain, domain)
 }
