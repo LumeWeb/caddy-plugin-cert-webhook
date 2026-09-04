@@ -66,7 +66,7 @@ func TestDANECertGetter_GetCertificate_NonDANEDomain(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, server.URL),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	hello := &tls.ClientHelloInfo{ServerName: "example.com"}
@@ -83,7 +83,7 @@ func TestDANECertGetter_GetCertificate_EmptyServerName(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, "http://localhost"),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	hello := &tls.ClientHelloInfo{ServerName: ""}
@@ -121,7 +121,7 @@ func TestDANECertGetter_GetCertificate_DANEDomain(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, server.URL),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	hello := &tls.ClientHelloInfo{ServerName: "example"}
@@ -140,7 +140,7 @@ func TestDANECertGetter_GetCertificate_CachedCert(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, "http://localhost"),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	fakeCert := &tls.Certificate{}
@@ -181,7 +181,7 @@ func TestDANECertGetter_GetCertificate_ExpiredCacheRegenerates(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, server.URL),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	d.certs["example"] = &daneCachedCert{
@@ -239,7 +239,7 @@ func TestDANECertGetter_GetCertificate_ReusesPersistedKey(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, server.URL),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	hello := &tls.ClientHelloInfo{ServerName: "example"}
@@ -285,7 +285,7 @@ func TestDANECertGetter_GetCertificate_CorruptPersistedKeyFallsBack(t *testing.T
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, server.URL),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	hello := &tls.ClientHelloInfo{ServerName: "example"}
@@ -346,7 +346,7 @@ func TestDANECertGetter_GetCertificate_ConcurrentExpiryReusesKey(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, server.URL),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	// Pre-seed an EXPIRED cache entry carrying the key, simulating a renewal that
@@ -428,7 +428,7 @@ func TestDANECertGetter_GetCertificate_PortalUnreachable(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, "http://127.0.0.1:1"),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	hello := &tls.ClientHelloInfo{ServerName: "example"}
@@ -446,7 +446,7 @@ func TestDANECertGetter_CaddyModule(t *testing.T) {
 
 func TestDANEChecker_IsDANEDomain_NotFound(t *testing.T) {
 	// Multi-label domains (with dots) are ICANN, not DANE
-	c := NewDANEChecker(nil)
+	c := newTestChecker()
 	isDANE, ns, err := c.IsDANEDomain(context.Background(), "example.com")
 
 	assert.NoError(t, err)
@@ -456,7 +456,7 @@ func TestDANEChecker_IsDANEDomain_NotFound(t *testing.T) {
 
 func TestDANEChecker_IsDANEDomain_DANEEnabled(t *testing.T) {
 	// Single-label domains are alt-root = DANE
-	c := NewDANEChecker(nil)
+	c := newTestChecker()
 	isDANE, ns, err := c.IsDANEDomain(context.Background(), "example")
 
 	assert.NoError(t, err)
@@ -466,7 +466,7 @@ func TestDANEChecker_IsDANEDomain_DANEEnabled(t *testing.T) {
 
 func TestDANEChecker_IsDANEDomain_ICANNRejected(t *testing.T) {
 	// Multi-label domain is ICANN
-	c := NewDANEChecker(nil)
+	c := newTestChecker()
 	isDANE, ns, err := c.IsDANEDomain(context.Background(), "example.com")
 
 	assert.NoError(t, err)

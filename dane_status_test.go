@@ -102,7 +102,7 @@ func TestGetCertificate_ReclassifiedNonDANE(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, "http://localhost"),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	// A valid cached DANE cert exists and the domain was served (ready).
@@ -134,7 +134,7 @@ func TestGetCertificate_CachedCertReestablishesReady(t *testing.T) {
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
 		pusher:         newTestDANEManager(t, "http://localhost"),
-		checker:        NewDANEChecker(nil),
+		checker:        newTestChecker(),
 	}
 
 	// Valid cached DANE cert; ready was briefly cleared (e.g. a transient flapping
