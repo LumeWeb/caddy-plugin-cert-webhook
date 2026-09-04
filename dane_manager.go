@@ -86,6 +86,12 @@ const daneCertTTL = 24 * time.Hour
 // daneStatusCacheTTLDefault is how long DANE status lookups are cached.
 const daneStatusCacheTTLDefault = 5 * time.Minute
 
+// daneStatusLookupTimeout bounds a DANE status lookup performed on behalf of
+// concurrent handshakes via singleflight. It is detached from the first
+// caller's request context so that one cancelled TLS handshake cannot fail
+// every waiter sharing the deduplicated result.
+const daneStatusLookupTimeout = 10 * time.Second
+
 // CaddyModule returns the Caddy module information.
 func (*DANECertGetter) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -176,9 +182,15 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 	// stops reporting ready immediately.
 	isDANE, namespace, daneCached := d.cachedDANEStatus(domain)
 	if !daneCached {
-		// Use singleflight to deduplicate concurrent DANE status lookups
+		// Use singleflight to deduplicate concurrent DANE status lookups.
+		// The lookup runs on a detached context with its own timeout: an
+		// error (e.g. a cancelled handshake context) from the first caller
+		// is returned to every concurrent waiter, so a caller-bound context
+		// would amplify one timeout into a burst of handshake failures.
 		val, err, _ := d.sf.Do("status:"+domain, func() (any, error) {
-			isDANE, namespace, err := d.checker.IsDANEDomain(ctx, domain)
+			statusCtx, cancel := context.WithTimeout(context.Background(), daneStatusLookupTimeout)
+			defer cancel()
+			isDANE, namespace, err := d.checker.IsDANEDomain(statusCtx, domain)
 			if err != nil {
 				return nil, err
 			}

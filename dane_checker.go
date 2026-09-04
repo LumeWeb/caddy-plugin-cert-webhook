@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	icann "go.lumeweb.com/icann-tlds"
 	ipfs "go.lumeweb.com/ipfs-sdk"
@@ -52,17 +54,57 @@ type DANEChecker struct {
 	registry icann.Registry
 }
 
-// NewDANEChecker creates a DANE domain checker with the given portal lookup.
-// The ICANN root-zone registry is created with defaults and fetched lazily
-// on first classification.
-func NewDANEChecker(lookup WebsiteLookup) *DANEChecker {
-	reg, err := icann.New(icann.WithLogger(zap.NewNop()))
-	if err != nil {
-		// icann.New only fails on invalid options; defaults are valid.
-		// This branch is unreachable but keeps the checker usable.
-		reg, _ = icann.New()
+// checkerRegistryRefreshInterval controls how often the process-wide
+// registry re-fetches the IANA root-zone list so newly delegated TLDs are
+// adopted without a restart.
+const checkerRegistryRefreshInterval = 24 * time.Hour
+
+var (
+	checkerRegistryOnce sync.Once
+	checkerRegistry     icann.Registry
+)
+
+// sharedCheckerRegistry returns the process-wide ICANN registry, starting
+// its lazy fetch and background refresh on first use. Sharing one instance
+// across checkers keeps portal availability decoupled from real ICANN
+// issuance even as Caddy configurations reload.
+func sharedCheckerRegistry() icann.Registry {
+	checkerRegistryOnce.Do(func() {
+		reg, err := icann.New(icann.WithLogger(zap.NewNop()))
+		if err != nil {
+			// icann.New only fails on invalid options; defaults are
+			// valid, so this is unreachable but keeps the checker usable.
+			reg, _ = icann.New()
+		}
+		checkerRegistry = reg
+		go refreshCheckerRegistry(context.Background(), reg, checkerRegistryRefreshInterval)
+	})
+	return checkerRegistry
+}
+
+// refreshCheckerRegistry periodically re-fetches the root-zone list until
+// ctx is cancelled. Fetch diagnostics (including failures) are logged by
+// the registry itself; a failed refresh keeps the previously loaded list.
+func refreshCheckerRegistry(ctx context.Context, reg icann.Registry, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = reg.Refresh(rctx)
+			cancel()
+		}
 	}
-	return &DANEChecker{lookup: lookup, registry: reg}
+}
+
+// NewDANEChecker creates a DANE domain checker with the given portal lookup.
+// The ICANN root-zone registry is process-wide, fetched lazily on first
+// classification, and refreshed periodically in the background.
+func NewDANEChecker(lookup WebsiteLookup) *DANEChecker {
+	return &DANEChecker{lookup: lookup, registry: sharedCheckerRegistry()}
 }
 
 // IsDANEDomain checks whether a domain is DANE-enabled.

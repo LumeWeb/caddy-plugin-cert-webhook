@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -21,9 +22,10 @@ import (
 // fakeRegistry is a canned icann.Registry implementation so tests never hit
 // the network to fetch the IANA root-zone list.
 type fakeRegistry struct {
-	tlds  map[string]bool
-	error error
-	calls int
+	tlds         map[string]bool
+	error        error
+	calls        int
+	refreshCalls int
 }
 
 func (f *fakeRegistry) IsICANN(ctx context.Context, domain string) (bool, error) {
@@ -59,6 +61,7 @@ func (f *fakeRegistry) TLDs(ctx context.Context) ([]string, error) {
 }
 
 func (f *fakeRegistry) Refresh(ctx context.Context) error {
+	f.refreshCalls++
 	return f.error
 }
 
@@ -79,7 +82,14 @@ type stubWebsiteLookup struct {
 
 func (s *stubWebsiteLookup) GetGatewayWebsite(ctx context.Context, domain string) (*ipfs.GatewayWebsiteResponse, error) {
 	s.calls++
-	return s.response, s.error
+	if s.error != nil {
+		return s.response, s.error
+	}
+	// Respect cancellation so context-handling regressions are observable.
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return s.response, nil
 }
 
 // websiteWithNamespace builds a canned portal response for a namespace.
@@ -271,6 +281,55 @@ func TestDANECertGetter_GetCertificate_StatusCheckErrorFailsHandshake(t *testing
 	assert.Contains(t, err.Error(), "DANE status check failed")
 }
 
+// TestRefreshCheckerRegistry_PeriodicRefresh verifies the background
+// refresher keeps re-fetching the root-zone list so newly delegated ICANN
+// TLDs are adopted without a restart.
+func TestRefreshCheckerRegistry_PeriodicRefresh(t *testing.T) {
+	reg := &fakeRegistry{tlds: map[string]bool{"com": true}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		cancel()
+	}()
+	refreshCheckerRegistry(ctx, reg, 20*time.Millisecond)
+
+	assert.GreaterOrEqual(t, reg.refreshCalls, 2, "refresher should tick repeatedly until cancelled")
+}
+
+// TestDANECertGetter_GetCertificate_CancelledHandshakeContext verifies the
+// singleflight context isolation: one handshake's cancelled request context
+// must not poison the deduplicated status lookup for concurrent waiters —
+// the lookup runs on a detached context, so classification still succeeds.
+func TestDANECertGetter_GetCertificate_CancelledHandshakeContext(t *testing.T) {
+	lookup := &stubWebsiteLookup{response: websiteWithNamespace(NamespaceHNS)}
+	c := newTestChecker()
+	c.lookup = lookup
+
+	d := &DANECertGetter{
+		logger:         zap.NewNop(),
+		certs:          make(map[string]*daneCachedCert),
+		statusCache:    make(map[string]*daneStatusEntry),
+		statusCacheTTL: daneStatusCacheTTLDefault,
+		pusher:         newTestDANEManager(t, "http://127.0.0.1:1"),
+		checker:        c,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	hello := &tls.ClientHelloInfo{ServerName: "pinner.hns"}
+	cert, err := d.GetCertificate(ctx, hello)
+
+	require.NoError(t, err, "cancelled handshake context must not fail the shared status lookup")
+	require.NotNil(t, cert)
+
+	// Waiters sharing the singleflight result must also succeed.
+	cert2, err := d.GetCertificate(context.Background(), hello)
+	require.NoError(t, err)
+	require.NotNil(t, cert2)
+}
+
 // TestDANECertGetter_GetCertificate_DottedHNSDomain is the full-stack
 // regression: a dotted Handshake domain is served a DANE cert instead of
 // falling through to ACME (which rejects .hns as not a public suffix).
@@ -298,7 +357,7 @@ func TestDANECertGetter_GetCertificate_DottedHNSDomain(t *testing.T) {
 	d := &DANECertGetter{
 		logger:         zap.NewNop(),
 		PortalURL:      server.URL,
-		GatewaySecret:  "test-secret",
+		GatewaySecret:  os.Getenv("CERTWEBHOOK_GATEWAY_SECRET"),
 		certs:          make(map[string]*daneCachedCert),
 		statusCache:    make(map[string]*daneStatusEntry),
 		statusCacheTTL: daneStatusCacheTTLDefault,
