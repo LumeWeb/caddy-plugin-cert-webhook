@@ -54,7 +54,7 @@ type DANECertGetter struct {
 	logger  *zap.Logger
 	portal  *PortalClient
 	pusher  *DANECertManager
-	checker *DANEChecker
+	checker DaneChecker
 
 	mu    sync.RWMutex
 	certs map[string]*daneCachedCert
@@ -189,7 +189,12 @@ func (d *DANECertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHe
 			d.logger.Debug("failed to check DANE status for domain",
 				zap.String("domain", domain),
 				zap.Error(err))
-			return nil, nil
+			// IsDANEDomain only errors for domains it could not prove to be
+			// an ICANN Tld. Never fall through to public ACME in that case:
+			// public CAs reject alt-root names outright, so the handshake
+			// must fail fast instead of issue-leaking an unobtainable ACME
+			// order on every retry.
+			return nil, fmt.Errorf("DANE status check failed for %s: %w", domain, err)
 		}
 		result := val.([]any)
 		isDANE = result[0].(bool)

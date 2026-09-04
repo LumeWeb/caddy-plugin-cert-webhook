@@ -2,6 +2,7 @@ package certwebhook
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	icann "go.lumeweb.com/icann-tlds"
@@ -27,29 +28,25 @@ func NormalizeDomain(domain string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
 }
 
-// IsDaneDomain reports whether a domain is an alt-root candidate by the
-// single-label heuristic (no dot can never resolve via standard ICANN DNS).
-//
-// This was the primary pre-ICANN-registry classifier and is wrong for dotted
-// alt-root names like pinner.hns. It is retained only as the degraded
-// fallback used by DANEChecker.IsDANEDomain when the ICANN root-zone
-// registry cannot be loaded; prefer the checker in all other cases.
-func IsDaneDomain(domain string) bool {
-	return domain != "" && !strings.Contains(domain, ".")
-}
-
 // WebsiteLookup provides portal website lookups for DANE classification.
 type WebsiteLookup interface {
 	GetGatewayWebsite(ctx context.Context, domain string) (*ipfs.GatewayWebsiteResponse, error)
 }
 
+// DaneChecker is the classification surface DANECertGetter depends on.
+type DaneChecker interface {
+	// IsDANEDomain reports whether a domain requires DANE TLSA support
+	// and which namespace it belongs to.
+	IsDANEDomain(ctx context.Context, domain string) (bool, string, error)
+}
+
 // DANEChecker determines whether a domain needs DANE TLSA support.
 //
-// Classification is TLD-driven rather than "contains a dot" based: a domain
-// whose final label is an IANA-registered TLD (e.g. example.com) is ICANN;
-// anything else — including dotted alt-root names like pinner.hns — is an
-// alt-root candidate for which the portal's namespace response is the
-// source of truth.
+// The portal's namespace response is the sole classification authority: no
+// structural property of the name (label count, suffix shape) ever marks a
+// domain as DANE. The ICANN root-zone registry is used only as a fast path
+// to skip the portal for domains whose final label is a registered ICANN
+// TLD — such a name can never be alt-root.
 type DANEChecker struct {
 	lookup   WebsiteLookup
 	registry icann.Registry
@@ -70,53 +67,42 @@ func NewDANEChecker(lookup WebsiteLookup) *DANEChecker {
 
 // IsDANEDomain checks whether a domain is DANE-enabled.
 //
-// A domain whose final label is a known ICANN TLD is classified ICANN
-// immediately; the portal is never consulted for it. For any other domain —
-// a single label, or a dotted name under an alt-root TLD such as hns — the
-// portal's namespace response is authoritative, and absent a portal answer
-// the domain falls back to DANE/HNS (it cannot be issued via public ACME
-// anyway). If the ICANN registry itself failed to load, classification
-// degrades to the single-label heuristic.
+// A domain whose final label is a registered ICANN TLD is classified ICANN
+// immediately; the portal is never consulted for it. For every other
+// domain — dotted alt-root names like pinner.hns and single labels alike —
+// the portal must answer with a namespace. When the portal is unreachable
+// or the registry cannot load, classification fails with an error instead
+// of guessing, so callers can fail the handshake rather than either serve
+// DANE blindly or fall through to public ACME.
 func (d *DANEChecker) IsDANEDomain(ctx context.Context, domain string) (bool, string, error) {
 	domain = NormalizeDomain(domain)
 	if domain == "" {
 		return false, NamespaceICANN, nil
 	}
 
-	isICANN, err := d.registry.IsICANN(ctx, domain)
-	if err != nil {
-		// Registry list unavailable (e.g. IANA unreachable at startup):
-		// degrade to the heuristic instead of misclassifying alt-root
-		// domains as ICANN and falling through to public ACME.
-		if IsDaneDomain(domain) {
-			return d.classifyViaPortal(ctx, domain)
-		}
+	isICANN, regErr := d.registry.IsICANN(ctx, domain)
+	if regErr == nil && isICANN {
 		return false, NamespaceICANN, nil
 	}
 
-	if isICANN {
-		return false, NamespaceICANN, nil
-	}
-
-	return d.classifyViaPortal(ctx, domain)
-}
-
-// classifyViaPortal determines namespace from the portal when available.
-// The portal's namespace response is the source of truth for alt-root
-// candidates; when no lookup exists or it fails, the domain is assumed to
-// be an alt-root (DANE/HNS) candidate.
-func (d *DANEChecker) classifyViaPortal(ctx context.Context, domain string) (bool, string, error) {
 	if d.lookup != nil {
-		resp, err := d.lookup.GetGatewayWebsite(ctx, domain)
-		if err == nil && resp != nil && resp.Namespace != nil {
-			ns := string(*resp.Namespace)
-			if ns == NamespaceHNS {
-				return true, NamespaceHNS, nil
-			}
-			return false, NamespaceICANN, nil
+		resp, lookupErr := d.lookup.GetGatewayWebsite(ctx, domain)
+		if lookupErr != nil {
+			return false, NamespaceICANN, fmt.Errorf("classify %s: portal lookup failed: %w", domain, lookupErr)
 		}
-		// Portal lookup failed or namespace not set — fall back to alt-root
+		if resp == nil {
+			return false, NamespaceICANN, fmt.Errorf("classify %s: portal returned no website data", domain)
+		}
+		if resp.Namespace != nil && string(*resp.Namespace) == NamespaceHNS {
+			return true, NamespaceHNS, nil
+		}
+		return false, NamespaceICANN, nil
 	}
 
-	return true, NamespaceHNS, nil
+	if regErr != nil {
+		return false, NamespaceICANN, fmt.Errorf(
+			"classify %s: portal lookup unavailable and icann registry failed to load: %w", domain, regErr)
+	}
+	return false, NamespaceICANN, fmt.Errorf(
+		"classify %s: portal lookup unavailable and %s is not a registered icann tld", domain, domain)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -81,10 +82,11 @@ func (s *stubWebsiteLookup) GetGatewayWebsite(ctx context.Context, domain string
 	return s.response, s.error
 }
 
+// websiteWithNamespace builds a canned portal response for a namespace.
+// The enum type behind GatewayWebsiteResponse.Namespace is only defined
+// in the SDK's internal client package, so it cannot be named here;
+// construct the pointer through reflection instead.
 func websiteWithNamespace(namespace string) *ipfs.GatewayWebsiteResponse {
-	// The enum type behind GatewayWebsiteResponse.Namespace is only defined
-	// in the SDK's internal client package, so it cannot be named here;
-	// construct the pointer through reflection instead.
 	resp := &ipfs.GatewayWebsiteResponse{}
 	nsField := reflect.ValueOf(resp).Elem().FieldByName("Namespace")
 	nsVal := reflect.New(nsField.Type().Elem())
@@ -93,20 +95,29 @@ func websiteWithNamespace(namespace string) *ipfs.GatewayWebsiteResponse {
 	return resp
 }
 
+// stubDANEChecker is a fully canned DaneChecker for manager-level tests
+// that need to force a classification failure.
+type stubDANEChecker struct {
+	response bool
+	err      error
+}
+
+func (s *stubDANEChecker) IsDANEDomain(ctx context.Context, domain string) (bool, string, error) {
+	if s.err != nil {
+		return false, NamespaceICANN, s.err
+	}
+	return s.response, NamespaceHNS, nil
+}
+
 // newTestChecker returns a DANEChecker whose ICANN registry is a canned map
-// of common TLDs, so classification never triggers a real IANA fetch.
+// of common TLDs and whose portal lookup always answers with the HNS
+// namespace, so classification never triggers a real IANA fetch or a real
+// portal call. Tests that need a failing lookup build their own checker.
 func newTestChecker() *DANEChecker {
 	c := NewDANEChecker(nil)
 	c.registry = &fakeRegistry{tlds: map[string]bool{"com": true, "org": true, "net": true}}
+	c.lookup = &stubWebsiteLookup{response: websiteWithNamespace(NamespaceHNS)}
 	return c
-}
-
-func TestIsDaneDomain_HeuristicFallback(t *testing.T) {
-	// Retained as the degraded fallback only; single-label names are
-	// alt-root candidates, dotted names are not.
-	assert.True(t, IsDaneDomain("example"))
-	assert.False(t, IsDaneDomain("example.com"))
-	assert.False(t, IsDaneDomain(""))
 }
 
 func TestDANEChecker_IsDANEDomain_EmptyDomain(t *testing.T) {
@@ -133,17 +144,18 @@ func TestDANEChecker_IsDANEDomain_DottedHNSViaPortal(t *testing.T) {
 }
 
 func TestDANEChecker_IsDANEDomain_DottedHNSPortalDown(t *testing.T) {
-	// Portal unreachable: a domain under a non-ICANN TLD is still an
-	// alt-root candidate (public ACME cannot issue for it).
+	// Portal unreachable for a non-ICANN-TLD name: classification must
+	// fail rather than guess (there is no valid structural shortcut).
 	lookup := &stubWebsiteLookup{error: context.DeadlineExceeded}
 	c := newTestChecker()
 	c.lookup = lookup
 
 	isDANE, ns, err := c.IsDANEDomain(context.Background(), "pinner.hns")
 
-	assert.NoError(t, err)
-	assert.True(t, isDANE, "alt-root domain with portal down should fall back to DANE")
-	assert.Equal(t, NamespaceHNS, ns)
+	require.Error(t, err)
+	assert.False(t, isDANE)
+	assert.Equal(t, NamespaceICANN, ns)
+	assert.Contains(t, err.Error(), "portal lookup failed")
 }
 
 func TestDANEChecker_IsDANEDomain_ICANNTLDSkipsPortal(t *testing.T) {
@@ -163,7 +175,7 @@ func TestDANEChecker_IsDANEDomain_ICANNTLDSkipsPortal(t *testing.T) {
 
 func TestDANEChecker_IsDANEDomain_PortalNamespaceIsSourceOfTruth(t *testing.T) {
 	// The portal may report a non-HNS namespace for an alt-root TLD; its
-	// answer overrides the alt-root assumption.
+	// answer overrides any alt-root assumption.
 	lookup := &stubWebsiteLookup{response: websiteWithNamespace(NamespaceICANN)}
 	c := newTestChecker()
 	c.lookup = lookup
@@ -175,12 +187,9 @@ func TestDANEChecker_IsDANEDomain_PortalNamespaceIsSourceOfTruth(t *testing.T) {
 	assert.Equal(t, NamespaceICANN, ns)
 }
 
-func TestDANEChecker_IsDANEDomain_SingleLabelPortalDown(t *testing.T) {
-	// Preserves the pre-existing fallback: single-label domains are
-	// alt-root candidates when no portal answer exists.
-	lookup := &stubWebsiteLookup{error: context.DeadlineExceeded}
+func TestDANEChecker_IsDANEDomain_SingleLabelWithPortal(t *testing.T) {
+	// Single labels carry no structural meaning; only the portal decides.
 	c := newTestChecker()
-	c.lookup = lookup
 
 	isDANE, ns, err := c.IsDANEDomain(context.Background(), "example")
 
@@ -189,22 +198,42 @@ func TestDANEChecker_IsDANEDomain_SingleLabelPortalDown(t *testing.T) {
 	assert.Equal(t, NamespaceHNS, ns)
 }
 
-func TestDANEChecker_IsDANEDomain_RegistryUnavailable(t *testing.T) {
-	// With the root-zone list unloaded, classification degrades to the
-	// single-label heuristic: dotted names stay ICANN (old behavior),
-	// single labels stay alt-root candidates.
+func TestDANEChecker_IsDANEDomain_RegistryUnavailableWithPortal(t *testing.T) {
+	// With the root-zone list unloaded the portal is the only authority;
+	// its namespace answer still classifies the domain.
 	c := newTestChecker()
 	c.registry = &fakeRegistry{error: context.DeadlineExceeded}
 
 	isDANE, ns, err := c.IsDANEDomain(context.Background(), "example.com")
+
 	assert.NoError(t, err)
+	assert.True(t, isDANE, "portal namespace must be honored when the registry is unavailable")
+	assert.Equal(t, NamespaceHNS, ns)
+}
+
+func TestDANEChecker_IsDANEDomain_RegistryAndPortalUnavailable(t *testing.T) {
+	// Both sources down: classification must fail, not guess.
+	c := newTestChecker()
+	c.registry = &fakeRegistry{error: context.DeadlineExceeded}
+	c.lookup = &stubWebsiteLookup{error: context.DeadlineExceeded}
+
+	isDANE, ns, err := c.IsDANEDomain(context.Background(), "example.com")
+
+	require.Error(t, err)
 	assert.False(t, isDANE)
 	assert.Equal(t, NamespaceICANN, ns)
+}
 
-	isDANE, ns, err = c.IsDANEDomain(context.Background(), "example")
-	assert.NoError(t, err)
-	assert.True(t, isDANE)
-	assert.Equal(t, NamespaceHNS, ns)
+func TestDANEChecker_IsDANEDomain_NoLookupAndUnknownTLD(t *testing.T) {
+	// No portal configured and a non-ICANN TLD: unclassifiable.
+	c := newTestChecker()
+	c.lookup = nil
+
+	isDANE, ns, err := c.IsDANEDomain(context.Background(), "pinner.hns")
+
+	require.Error(t, err)
+	assert.False(t, isDANE)
+	assert.Equal(t, NamespaceICANN, ns)
 }
 
 func TestDANEChecker_IsDANEDomain_CaseAndTrailingDot(t *testing.T) {
@@ -217,6 +246,29 @@ func TestDANEChecker_IsDANEDomain_CaseAndTrailingDot(t *testing.T) {
 	isDANE, _, err = c.IsDANEDomain(context.Background(), "PINNER.HNS.")
 	assert.NoError(t, err)
 	assert.True(t, isDANE, "case and trailing dot must not break alt-root classification")
+}
+
+// TestDANECertGetter_GetCertificate_StatusCheckErrorFailsHandshake verifies
+// the ACME fallthrough hardening: when classification fails for a domain,
+// the getter returns an error so certmagic aborts the handshake instead of
+// falling through to on-demand ACME, which public CAs reject for alt-root
+// names.
+func TestDANECertGetter_GetCertificate_StatusCheckErrorFailsHandshake(t *testing.T) {
+	d := &DANECertGetter{
+		logger:         zap.NewNop(),
+		certs:          make(map[string]*daneCachedCert),
+		statusCache:    make(map[string]*daneStatusEntry),
+		statusCacheTTL: daneStatusCacheTTLDefault,
+		pusher:         newTestDANEManager(t, "http://127.0.0.1:1"),
+		checker:        &stubDANEChecker{err: errors.New("portal unreachable")},
+	}
+
+	hello := &tls.ClientHelloInfo{ServerName: "pinner.hns"}
+	cert, err := d.GetCertificate(context.Background(), hello)
+
+	require.Error(t, err, "classification failure must fail the handshake, not fall through to ACME")
+	assert.Nil(t, cert)
+	assert.Contains(t, err.Error(), "DANE status check failed")
 }
 
 // TestDANECertGetter_GetCertificate_DottedHNSDomain is the full-stack
@@ -241,9 +293,7 @@ func TestDANECertGetter_GetCertificate_DottedHNSDomain(t *testing.T) {
 	}))
 	defer server.Close()
 
-	lookup := &stubWebsiteLookup{response: websiteWithNamespace(NamespaceHNS)}
 	c := newTestChecker()
-	c.lookup = lookup
 
 	d := &DANECertGetter{
 		logger:         zap.NewNop(),
